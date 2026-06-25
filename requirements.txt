@@ -1,0 +1,36 @@
+# Core
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-deepseek>=0.1.0
+pydantic>=2.0.0
+
+# Data
+yfinance>=0.2.40
+fredapi>=0.5.0
+wbgapi>=1.0.0
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Valuation
+numpy-financial>=1.0.0
+scipy>=1.10.0
+
+# Caching
+requests-cache>=1.0.0
+
+# UI (optional — Phase 4)
+streamlit>=1.30.0
+
+# PDF Report Generation
+reportlab>=4.0.0
+matplotlib>=3.7.0
+
+# Utilities
+python-dotenv>=1.0.0
+rich>=13.0.0
+
+# Web Search (DuckDuckGo free + Tavily optional)
+duckduckgo-search>=7.0.0
+
+# Testing
+pytest>=8.0.0

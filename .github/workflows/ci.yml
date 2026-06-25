@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch: # allow manual trigger
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+      fail-fast: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+        # Continue even if some optional packages fail (e.g. langgraph on
+        # certain platforms).  The unit tests only need the core packages.
+        continue-on-error: false
+
+      - name: Verify core imports
+        run: |
+          python -c "
+          import sys; sys.path.insert(0, '.')
+          # These MUST import for any tests to work
+          from src.utils.config import get_config
+          from src.utils.logger import get_logger
+          from src.data.data_cache import DataCache, TTL_DEFAULT
+          from src.valuation.dcf_model import DCFModel
+          from src.valuation.wacc_calculator import WACCCalculator
+          from src.valuation.relative_val import RelativeValuation
+          from src.valuation.monte_carlo import MonteCarloSimulation
+          print('All core imports OK')
+          "
+
+      - name: Run unit tests (no network)
+        run: |
+          python -m pytest tests/ \
+            -m "not integration" \
+            -v \
+            --tb=short \
+            --strict-markers \
+            --color=yes \
+            --junitxml=junit.xml \
+            --durations=10
+        env:
+          # Ensure no real API keys leak into CI
+          DEEPSEEK_API_KEY: ""
+          FRED_API_KEY: ""
+          FMP_API_KEY: ""
+          ALPHA_VANTAGE_API_KEY: ""
+          TAVILY_API_KEY: ""
+          # Prevent any accidental network calls from yfinance/fredapi
+          PYTHONUNBUFFERED: "1"
+
+      - name: Publish test summary
+        uses: test-summary/action@v2
+        with:
+          paths: junit.xml
+        if: always()
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-py${{ matrix.python-version }}
+          path: junit.xml
+        if: always()

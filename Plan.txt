@@ -1,0 +1,1253 @@
+================================================================================
+                    INTRENSIC-VALUATOR — IMPLEMENTATION PLAN
+================================================================================
+
+1. EXECUTIVE SUMMARY
+================================================================================
+
+The Intrensic Valuator is an agentic AI system that values publicly traded stocks
+and outputs a Buy/Sell/Hold recommendation. It uses a top-down fundamental
+analysis approach: Country (macro) → Industry (sector) → Company (firm-specific).
+Each layer is analyzed by a specialized AI agent, and the qualitative + quantitative
+outputs feed into a Discounted Cash Flow (DCF) model to compute intrinsic value.
+
+The final recommendation compares intrinsic value to market price with a margin of
+safety threshold, and includes a confidence score based on forecast uncertainty.
+
+--------------------------------------------------------------------------------
+2. THE TOP-DOWN VALUATION FRAMEWORK
+================================================================================
+
+2.1 Why Top-Down?
+--------------------------------------------------------------------------------
+Most automated valuation tools start and end with company financials — they
+ignore where the company operates and what industry it's in. But a tech company
+in India faces fundamentally different risks and opportunities than a tech company
+in the US. The top-down approach captures these structural differences:
+
+  COUNTRY  →  Defines the baseline cost of capital (sovereign risk, inflation,
+              currency stability, GDP trajectory)
+
+  INDUSTRY →  Defines the growth ceiling and competitive risk (TAM, Porter's
+              5 Forces, regulation, technological disruption risk)
+
+  COMPANY  →  Defines firm-specific execution ability (management quality,
+              competitive moat, financial health, growth track record)
+
+Each layer ADJUSTS the numbers from the layer above it. This cascading adjustment
+is the theoretically correct way to value a company in context.
+
+2.2 The Integration Point: WACC
+--------------------------------------------------------------------------------
+All three layers converge on the Weighted Average Cost of Capital (WACC):
+
+  WACC = f(Country_Risk, Industry_Beta, Company_Specific_Risk)
+
+Country risk sets the risk-free rate floor (via sovereign bond yields / CDS
+spreads). Industry risk determines beta (systematic risk relative to market).
+Company-specific risk adds a final premium for things like small size, high
+leverage, or operational complexity.
+
+This means every risk identified at any layer automatically makes the stock
+cheaper (higher discount rate = lower present value of future cash flows).
+This is the fundamental mechanism linking qualitative analysis to quantitative
+valuation.
+
+================================================================================
+3. ENVIRONMENT CONFIGURATION
+================================================================================
+
+3.1 .env File Setup
+--------------------------------------------------------------------------------
+All API keys are stored in a `.env` file at the project root. This is loaded
+by python-dotenv at application startup. The `.env.example` file serves as a
+template showing all required and optional keys.
+
+  Required:
+    DEEPSEEK_API_KEY       — DeepSeek platform API key (LLM agent calls)
+    FRED_API_KEY           — St. Louis FRED API key (US macro data)
+
+  Optional (fallback/enrichment):
+    FMP_API_KEY            — Financial Modeling Prep (analyst estimates)
+    ALPHA_VANTAGE_API_KEY  — Alpha Vantage (alternative data source)
+    TAVILY_API_KEY         — Tavily (web search, optional — falls back to DuckDuckGo)
+
+  The `.env` file is gitignored and NEVER committed to version control.
+
+  Web Search Strategy:
+    - Default: DuckDuckGo instant search (free, no API key, no rate limits)
+      via the `duckduckgo-search` Python library
+    - Enhanced: Tavily API when TAVILY_API_KEY is configured
+      (better structured results, but free tier is limited)
+    - Fallback logic: Try Tavily first if key is set; if quota exhausted or
+      error, automatically fall back to DuckDuckGo
+
+3.2 LLM Provider: DeepSeek
+--------------------------------------------------------------------------------
+  Primary model: deepseek-chat
+    - Supports tool calling and structured JSON output
+    - Excellent reasoning for financial analysis
+    - Cost-effective for multi-agent workflows (3-5 agent calls per valuation)
+
+  Fallback model: deepseek-reasoner
+    - For complex synthesis tasks requiring deeper chain-of-thought
+    - Used selectively for the Recommendation Agent final synthesis
+
+  Integration: langchain-deepseek (part of LangChain ecosystem)
+    ```python
+    from langchain_deepseek import ChatDeepSeek
+    llm = ChatDeepSeek(model="deepseek-chat", temperature=0.1)
+    ```
+
+================================================================================
+4. DATA SOURCES — WHAT, WHY, AND HOW
+================================================================================
+
+4.1 Primary Data Sources (FREE — no API key needed for basics)
+--------------------------------------------------------------------------------
+
+A. yfinance (Yahoo Finance)
+   - What: Stock price, income statement, balance sheet, cash flow statement,
+          shares outstanding, beta, industry/sector classification, peers
+   - Why: Most comprehensive free source for US stocks. Covers 99% of what
+          we need for financial statement data.
+   - How: Python library. Pull FCF from cash flow statement line items
+          (Operating Cash Flow - Capital Expenditure), NOT from info dict.
+          The info['freeCashflow'] field is known to be unreliable in yfinance.
+   - Rate limits: None officially, but use caching to be respectful.
+
+B. SEC EDGAR (XBRL API)
+   - What: Raw 10-K and 10-Q filings with structured financial data
+   - Why: Most accurate and auditable source. Used as verification layer.
+   - How: HTTP GET to SEC EDGAR API, parse XBRL-JSON or use edgartools library.
+          Maps XBRL concepts (us-gaap taxonomy) to our financial model fields.
+   - Rate limits: 10 requests/second. Very generous.
+
+C. FRED (Federal Reserve Economic Data via fredapi)
+   - What: 10-Year US Treasury yield (risk-free rate), GDP growth, CPI/inflation,
+          unemployment rate, federal funds rate
+   - Why: The gold standard for US macroeconomic data. Used to calibrate the
+          risk-free rate and macro growth assumptions.
+   - How: fredapi Python library. Requires a free FRED API key (sign up at
+          research.stlouisfed.org).
+   - Rate limits: 120 requests/minute with API key.
+
+D. World Bank API (via wbgapi)
+   - What: GDP growth, inflation, population, governance indicators by country
+   - Why: Needed for non-US stocks to calibrate country-level macro assumptions.
+          Governance indicators serve as proxies for political stability.
+   - How: wbgapi Python library. No API key required.
+   - Rate limits: Generous, no strict limit documented.
+
+4.2 Secondary Data Sources (Freemium — used as fallback/enrichment)
+--------------------------------------------------------------------------------
+
+E. Financial Modeling Prep (FMP)
+   - What: Analyst consensus estimates, pre-computed DCF, treasury rates,
+          market risk premium data, enterprise values
+   - Why: Analyst estimates provide a useful sanity check against our AI-generated
+          projections. Pre-computed DCF can serve as a benchmark.
+   - How: REST API with API key. Free tier: 250 requests/day.
+   - URL: https://financialmodelingprep.com/developer/docs/
+
+F. Alpha Vantage
+   - What: Income statement, balance sheet, cash flow, forex rates
+   - Why: Alternative data source if yfinance has gaps (especially for
+          international stocks).
+   - How: REST API with API key. Free tier: 25 requests/day.
+   - URL: https://www.alphavantage.co/
+
+4.3 Data Caching Strategy ✅ IMPLEMENTED
+--------------------------------------------------------------------------------
+
+A dual-layer caching system prevents redundant API calls during development and
+repeated valuation runs. Both layers are built and verified.
+
+Financial data changes on known schedules:
+  - Stock prices: Daily (or real-time, but daily is enough for valuation)
+  - Financial statements: Quarterly (10-Q) and Annually (10-K)
+  - Macro data: Monthly (CPI, employment) or Quarterly (GDP)
+
+Caching TTLs (enforced at application layer):
+  TTL_PRICE      = 86_400s  (1 day)   — stock quotes
+  TTL_FINANCIALS = 604_800s (7 days)  — income stmt, balance sheet, cash flow
+  TTL_MACRO_RATES= 604_800s (7 days)  — treasury yields, interest rates
+  TTL_MACRO_GDP  = 2_592_000s (30 days) — GDP growth, CPI, macro aggregates
+  TTL_ESTIMATES  = 604_800s (7 days)  — analyst consensus estimates
+  TTL_DEFAULT    = 86_400s  (1 day)   — fallback
+
+Cache key convention: "{source}:{identifier}:{data_type}"
+  Examples: "yfinance:AAPL:cash_flow", "fred:GDP:quarterly",
+            "worldbank:IN:gdp_growth", "fmp:AAPL:analyst_estimates"
+
+Layer 1 — Application Cache (src/data/data_cache.py)
+  Class: DataCache(db_path) — SQLite-backed, thread-safe, TTL-driven.
+
+  Schema:
+    CREATE TABLE cache_entries (
+        key        TEXT PRIMARY KEY,
+        value      TEXT NOT NULL,     -- JSON-serialized
+        expires_at REAL NOT NULL,     -- Unix timestamp
+        created_at REAL NOT NULL
+    );
+
+  Design decisions:
+    - JSON serialization with custom encoder for numpy scalars/arrays,
+      pandas DataFrames (orient="split"), and pandas Series
+    - Lazy eviction: expired entries detected and deleted on get() —
+      no background thread required
+    - WAL journal mode for concurrent reads
+    - threading.Lock around writes; reads are lock-free
+    - Hit/miss/expiration counters exposed via stats()
+
+  API: get(key) → Any|None, set(key, value, ttl_seconds), delete(key),
+       clear(), expire() → count, stats() → dict
+
+Layer 2 — HTTP Cache (src/data/http_cache.py)
+  Thin wrapper around requests_cache.CachedSession.
+
+  URL-pattern TTLs:
+    *.yahoo.com/*              → 1 day
+    data.sec.gov/*, www.sec.gov/* → 1 day
+    api.stlouisfed.org/*       → 7 days
+    api.worldbank.org/*        → 30 days
+    financialmodelingprep.com/* → 7 days
+    www.alphavantage.co/*      → 7 days
+
+  Settings:
+    - Backend: SQLite (separate DB from application cache)
+    - stale_if_error=True (serve stale cache if the remote is down)
+    - allowable_codes=(200, 301, 302, 404) (cache 404s briefly)
+    - Singleton via get_http_session()
+
+  Fetcher modules call session.get() directly — caching is transparent;
+  they don't need to interact with the application cache unless they
+  want to cache post-processed results.
+
+Verified behavior (all tests passed):
+  - set/get with dict, list, scalar values
+  - TTL expiry (lazy eviction on read)
+  - None on miss and on expired key
+  - NumPy float64, int64, bool_, ndarray round-trip
+  - Pandas DataFrame and Series round-trip
+  - Stats counters (hits, misses, expirations, hit rate, DB size)
+  - Explicit expire(), delete(), clear()
+
+================================================================================
+5. THE DCF VALUATION ENGINE
+================================================================================
+
+5.1 Free Cash Flow Calculation
+--------------------------------------------------------------------------------
+Starting point — pull from the most recent fiscal year or trailing twelve months:
+
+  FCF = Operating_Cash_Flow − Capital_Expenditure
+
+  Where:
+    Operating Cash Flow = Line item from Cash Flow Statement
+    Capital Expenditure = Line item from Cash Flow Statement
+                          (often labeled "Purchase of Property, Plant & Equipment"
+                          or "Capital Expenditure")
+
+  If OCF > Net Income consistently → Quality earnings (positive signal)
+  If Capex < Depreciation consistently → Underinvesting (negative signal)
+
+5.2 Revenue & FCF Projection (Years 1-5 explicit, then terminal)
+--------------------------------------------------------------------------------
+The projection embeds the top-down analysis directly into the numbers:
+
+  Revenue_Year_N = Revenue_Base × Π(i=1 to N) (1 + Growth_Rate_i)
+
+  Where Growth_Rate_i starts at the company-specific rate (from Company Agent),
+  then decays toward the industry rate (from Industry Agent), and finally
+  toward the terminal growth rate (from Country Agent).
+
+  Decay formula: Growth_Rate_i = Company_Growth + (i/5) × (Industry_Growth − Company_Growth)
+  for years 1-3, then Industry_Growth + ((i-3)/2) × (Terminal_Growth − Industry_Growth)
+  for years 4-5.
+
+  FCF_Year_N = Revenue_Year_N × FCF_Margin_Year_N
+
+  Where FCF_Margin_Year_N = Base_FCF_Margin + adjustment from company/industry analysis.
+
+5.3 WACC Calculation (THE INTEGRATION POINT)
+--------------------------------------------------------------------------------
+This is where ALL three layers of analysis converge. Every risk identified in
+the top-down analysis feeds into WACC, which determines how aggressively we
+discount future cash flows.
+
+  WACC = (E/V) × Cost_of_Equity + (D/V) × Cost_of_Debt × (1 − Tax_Rate)
+
+  Where:
+
+  A) Cost of Equity (CAPM with Country Risk Premium):
+     Cost_of_Equity = Risk_Free_Rate + Industry_Beta × Equity_Risk_Premium
+                      + Country_Risk_Premium + Size_Premium
+
+     Risk_Free_Rate:
+       - Source: 10-Year US Treasury yield from FRED
+       - For non-US stocks: Local 10-year government bond yield
+       - Market convention: Use the yield on the longest-dated government bond
+         of the country where the company operates
+
+     Equity Risk Premium (ERP):
+       - Default: 5.0% for developed markets, higher for emerging
+       - Source: Can be estimated from FMP or use Damodaran's published ERP
+         (Aswath Damodaran at NYU publishes this annually — widely used standard)
+       - Typical ranges: US 4.5-5.5%, Emerging Markets 6-9%
+
+     Industry Beta:
+       - Source: Calculate from peer group stock returns vs S&P 500, or
+         use Damodaran's industry beta tables (published by sector)
+       - If using peer betas: Median unlevered beta of 5-10 industry peers,
+         then relevered to the company's own D/E ratio
+       - Hamada formula: β_levered = β_unlevered × [1 + (1 − Tax) × (D/E)]
+
+     Country Risk Premium (CRP):
+       - Source: Country Agent analysis
+       - Measurement approaches:
+         a) Sovereign CDS spread vs US CDS (market-based, preferred)
+         b) Sovereign bond yield spread vs US Treasury (for countries with bonds)
+         c) Damodaran's country risk premiums (published annually, covers 190+ countries)
+         d) Governance indicators mapped to risk premiums
+       - Typical values: Germany 0%, US 0%, Brazil 2-4%, India 2-3%,
+         China 1-2%, Argentina 8-15%, Turkey 5-10%
+       - This is the SINGLE LARGEST source of cross-country valuation differences
+
+     Size Premium:
+       - Additional return required for small-cap stocks
+       - Source: CRSP Decile premiums or Duff & Phelps size premium study
+       - Typical: 0% for mega-cap, 1-3% for small-cap, 3-6% for micro-cap
+       - Only apply when market cap < $2B
+
+  B) Cost of Debt:
+     Cost_of_Debt = (Risk_Free_Rate + Credit_Spread) × (1 − Tax_Rate)
+
+     Credit_Spread:
+       - Estimated from company's credit rating, interest coverage ratio,
+         or debt/EBITDA
+       - Moody's/S&P rating → spread mapping tables are well-documented
+       - If no public rating: Estimate synthetic rating from financial ratios
+         - Interest Coverage Ratio > 8.5 → AAA (~0.7% spread)
+         - ICR 6.5-8.5 → AA (~1.0%)
+         - ICR 5.5-6.5 → A (~1.3%)
+         - ICR 4.25-5.5 → BBB (~2.0%)
+         - ICR 3.0-4.25 → BB (~3.5%)
+         - ICR 2.5-3.0 → B (~5.0%)
+         - ICR < 2.5 → CCC+ (~8%+)
+
+     Tax Rate:
+       - Use effective tax rate from income statement (Tax / Pre-Tax Income)
+       - Or statutory corporate tax rate for the country
+
+  C) Capital Structure Weights (E/V and D/V):
+     - E/V = Market_Cap / (Market_Cap + Total_Debt)
+     - D/V = Total_Debt / (Market_Cap + Total_Debt)
+     - Use MARKET values, not book values
+     - Market Cap = Current Price × Shares Outstanding
+     - Total Debt = Short-term Debt + Long-term Debt (from balance sheet)
+
+5.4 Terminal Value
+--------------------------------------------------------------------------------
+The terminal value typically represents 60-80% of total enterprise value in a
+DCF model. Small changes in assumptions produce wildly different results.
+We calculate TWO methods and use the average:
+
+  Method 1: Perpetuity Growth (Gordon Growth Model)
+    TV = FCF_Year_5 × (1 + g) / (WACC − g)
+    Where g = terminal growth rate ≈ long-term nominal GDP growth of the country
+    (capped at risk-free rate). Typically 2.0-3.5% for developed markets.
+
+  Method 2: Exit Multiple
+    TV = EBITDA_Year_5 × Industry_Median_EV/EBITDA_Multiple
+    This serves as a market-based sanity check on the perpetuity method.
+
+  Final TV = Average of both methods (or weighted: 70% perpetuity, 30% exit)
+
+5.5 Present Value Calculation
+--------------------------------------------------------------------------------
+  Enterprise_Value =  Σ(t=1 to 5) FCF_t / (1 + WACC)^t
+                      + Terminal_Value / (1 + WACC)^5
+
+  Equity_Value = Enterprise_Value
+                 − Total_Debt
+                 + Cash_and_Cash_Equivalents
+                 − Minority_Interest
+                 + Investments_in_Associates
+
+  Intrinsic_Value_Per_Share = Equity_Value / Diluted_Shares_Outstanding
+
+5.6 Relative Valuation (Sanity Check)
+--------------------------------------------------------------------------------
+DCF is sensitive to assumptions. We cross-validate with relative valuation:
+
+  P/E Approach:   Fair_Price = Median(Peer_Group_P/E) × Company_TTM_EPS
+  EV/EBITDA:      Fair_EV = Median(Peer_EV/EBITDA) × Company_EBITDA
+  P/B Approach:   Fair_Price = Median(Peer_P/B) × Company_Book_Value_Per_Share
+
+  Peer group selection:
+    - Same GICS industry/sub-industry
+    - Similar market cap (±50%)
+    - Similar revenue size
+    - Min 5 peers, ideally 8-12
+
+  Final check: If DCF intrinsic value deviates >50% from relative valuation
+  median, flag a "model disagreement" warning and widen confidence interval.
+
+5.7 Scenario Analysis & Monte Carlo
+--------------------------------------------------------------------------------
+  Scenario 1: Bull Case
+    - Revenue growth: +20% above base
+    - FCF margin: +200 bps
+    - WACC: −100 bps
+    - Terminal growth: +50 bps
+
+  Scenario 2: Base Case
+    - All inputs at expected values from agent analysis
+
+  Scenario 3: Bear Case
+    - Revenue growth: −20% below base
+    - FCF margin: −200 bps
+    - WACC: +150 bps
+    - Terminal growth: −50 bps
+
+  Monte Carlo Simulation (10,000 iterations):
+    - Vary: Revenue growth (normal dist), FCF margin (normal dist),
+      WACC (normal dist), terminal growth (normal dist)
+    - Output: Distribution of intrinsic values → mean, median, std dev,
+      10th percentile, 90th percentile
+    - The std dev feeds into confidence scoring
+
+  Final Fair Value Range: [10th percentile, 90th percentile]
+
+================================================================================
+6. AGENTIC AI WORKFLOW (LangGraph Implementation)
+================================================================================
+
+6.1 Why Agentic AI?
+--------------------------------------------------------------------------------
+Traditional automated valuation uses hard-coded rules. But financial analysis
+requires:
+  - Interpreting nuanced qualitative information (earnings call tone,
+    management track record, competitive dynamics)
+  - Adapting to unusual situations (turnarounds, M&A, accounting changes)
+  - Synthesizing information across multiple dimensions and sources
+  - Applying judgment to edge cases where formulas break
+
+LLM agents can do all of this — IF you give them the right tools, prompts, and
+structured output formats. They don't replace the quantitative model; they feed
+its inputs.
+
+6.2 Orchestrator Architecture (LangGraph)
+--------------------------------------------------------------------------------
+We use LangGraph to build a directed graph of agent nodes. Each node is an
+LLM call with specific tools and a structured output schema.
+
+  State flows:
+    START → CountryAgent → IndustryAgent → CompanyAgent
+          → ValuationEngine → RecommendationAgent → END
+
+  Each node:
+    1. Receives the full state (all prior analysis)
+    2. Has access to data-fetching tools (yfinance, FRED, web search)
+    3. Produces structured output (Pydantic model) that merges into state
+    4. Passes enriched state to next node
+
+  The ValuationEngine node is NOT an LLM call — it's pure Python computation
+  that takes the structured outputs from the three analysis agents and runs
+  the DCF model. This ensures the math is always correct and reproducible.
+
+6.3 Agent-Specific Designs
+--------------------------------------------------------------------------------
+
+  AGENT 1: Country/Macro Agent
+  Inputs: Company name, ticker, identified country
+  Tools: FRED API, World Bank API, web search for current events
+  Analysis:
+    - GDP growth trend (past 5 years + forward outlook)
+    - Inflation & interest rate environment
+    - Currency stability and exchange rate trends
+    - Political stability (World Bank governance indicators)
+    - Central bank policy trajectory
+    - Sovereign credit rating and CDS spreads
+    - Key country-specific risks (sanctions, capital controls, etc.)
+  Outputs:
+    - country: str
+    - gdp_growth_forecast: float (nominal, next 5 years)
+    - inflation_forecast: float
+    - political_stability_score: float (0-10)
+    - country_risk_premium: float (basis points, 0-1500)
+    - currency_risk_adj: float (additional discount, 0-500 bps)
+    - macro_narrative: str (1-2 paragraph summary)
+
+  AGENT 2: Industry Agent
+  Inputs: Company industry/sector, country context
+  Tools: yfinance (peer data), web search, SEC EDGAR (industry filings)
+  Analysis:
+    - Total Addressable Market (TAM) and growth rate
+    - Industry lifecycle stage (emerging, growth, mature, declining)
+    - Porter's 5 Forces: rivalry, barriers to entry, supplier power,
+      buyer power, substitutes
+    - Regulatory environment and upcoming changes
+    - Technological disruption risk
+    - Cyclicality and sensitivity to macro factors
+    - Peer group identification (5-10 closest competitors)
+    - Industry average financial metrics (margins, growth, leverage)
+  Outputs:
+    - industry: str
+    - industry_growth_rate: float (revenue CAGR next 5 years)
+    - industry_beta: float (unlevered)
+    - competitive_intensity_score: float (0-10, 10 = cutthroat)
+    - regulatory_risk_score: float (0-10)
+    - disruption_risk_score: float (0-10)
+    - peer_tickers: list[str]
+    - industry_fcf_margin_avg: float
+    - industry_narrative: str
+
+  AGENT 3: Company Agent
+  Inputs: Ticker, financial statements, industry context
+  Tools: yfinance, web search, SEC EDGAR
+  Analysis:
+    - Revenue growth trend (5-year historical + analyst estimates)
+    - Profitability: Gross margin, operating margin, net margin trends
+    - Free cash flow generation and quality
+    - Balance sheet health: Debt/Equity, Current Ratio, Interest Coverage
+    - Return on Invested Capital (ROIC) vs WACC (value creation test)
+    - Management quality assessment (from earnings calls, track record,
+      capital allocation history)
+    - Competitive moat assessment: Brand, network effects, switching costs,
+      cost advantage, intangible assets
+    - Growth drivers: New products, geographic expansion, pricing power,
+      acquisitions
+    - Risk factors: Customer concentration, key person risk, litigation,
+      obsolescence
+    - Financial statement red flags: Aggressive revenue recognition,
+      frequent one-time charges, growing DSO, inventory build
+  Outputs:
+    - revenue_growth_forecast: float (next 5-year CAGR)
+    - fcf_margin_forecast: float (steady-state margin)
+    - moat_width_score: float (0-10)
+    - management_quality_score: float (0-10)
+    - financial_health_score: float (0-10)
+    - company_specific_risk_premium: float (basis points, 0-500)
+    - roic: float
+    - debt_to_equity: float
+    - company_narrative: str
+
+  AGENT 4: Valuation Engine (Pure Python — no LLM)
+  Inputs: All structured outputs from above + yfinance financial data
+  Computation:
+    1. Pull FCF from cash flow statement
+    2. Project FCF for 5 years using growth rates from agents
+    3. Calculate WACC using CRP, beta, size premium
+    4. Calculate terminal value
+    5. Discount to present value
+    6. Calculate relative valuation comparables
+    7. Run Monte Carlo simulation (if enabled)
+    8. Blend DCF and relative valuation (70/30)
+  Outputs:
+    - intrinsic_value_per_share: float
+    - fair_value_low: float (10th percentile)
+    - fair_value_high: float (90th percentile)
+    - wacc: float
+    - terminal_value_pct: float (% of total EV from terminal value)
+    - relative_value_per_share: float
+    - model_disagreement_flag: bool
+
+  AGENT 5: Recommendation Agent
+  Inputs: Valuation outputs, current price, all narratives
+  Tools: None (synthesis only)
+  Analysis:
+    - Calculate margin of safety
+    - Assess model confidence based on:
+      a. Width of Monte Carlo distribution
+      b. Agreement between DCF and relative valuation
+      c. Data availability and quality
+      d. Stability of historical financials
+    - Consider qualitative factors that might override: pending catalysts
+      (FDA approval, contract wins), technical factors (extreme momentum)
+    - Generate clear, actionable recommendation
+  Outputs:
+    - recommendation: Literal["BUY", "SELL", "HOLD"]
+    - margin_of_safety: float (percentage)
+    - confidence_score: float (0-100)
+    - key_drivers: list[str] (3-5 bullet points)
+    - key_risks: list[str] (3-5 bullet points)
+    - executive_summary: str
+
+6.4 How Qualitative Becomes Quantitative (The Core Innovation)
+--------------------------------------------------------------------------------
+This is the hardest problem in automated valuation: converting text analysis
+into numbers that feed the DCF model. Here's the approach for each conversion:
+
+  CONVERSION TABLE:
+  ═══════════════════════════════════════════════════════════════════════
+  Qualitative Assessment          →  Quantitative Parameter     Range
+  ═══════════════════════════════════════════════════════════════════════
+  Country political stability     →  Country Risk Premium       0-1500 bps
+  Currency risk assessment        →  Additional discount        0-500 bps
+  Industry competitive intensity  →  FCF margin pressure        −500 to 0 bps
+  Regulatory risk                 →  Beta adjustment            ±0.2
+  Disruption risk                 →  Terminal growth modifier   ±1.0%
+  Moat width (wide/narrow/none)   →  Competitive adv. period    3-10 years
+  Management quality (1-10)       →  Execution premium/discount ±2% growth
+  Financial health (1-10)         →  Credit spread              70-800 bps
+  ROIC vs WACC gap                →  Value creation confidence  ± terminal val
+  ═══════════════════════════════════════════════════════════════════════
+
+  Each conversion uses CALIBRATED RANGES — the agents can pick any value within
+  the range but must justify the choice in the narrative output. The ranges are
+  derived from financial literature and practice (Damodaran, McKinsey, CFA
+  curriculum).
+
+  Example: The Country Agent assigns a CRP of 250 bps for India. It must output:
+    "India CRP of 250 bps based on: (1) S&P rates India BBB- with stable
+    outlook, (2) India 10-year bond yields 7.1% vs US 4.2% = 290 bps spread,
+    (3) governance indicators show moderate political stability at 6.2/10,
+    (4) inflation has been moderating but remains above target at 4.8%.
+    Weighted toward bond spread with slight discount for improving trajectory."
+
+================================================================================
+7. RECOMMENDATION LOGIC
+================================================================================
+
+7.1 Core Decision Rule
+--------------------------------------------------------------------------------
+  If Intrinsic_Value > Current_Price × 1.20:
+      → BUY (20%+ upside — sufficient margin of safety)
+  If Intrinsic_Value < Current_Price × 0.90:
+      → SELL (10%+ downside)
+  Else:
+      → HOLD
+
+  The asymmetric threshold (20% upside needed vs 10% downside) reflects:
+    - DCF models have an upward bias (terminal value is optimistic)
+    - Transaction costs and taxes favor holding
+    - Warren Buffett's principle: require a margin of safety on buys
+
+7.2 Confidence Scoring
+--------------------------------------------------------------------------------
+  Confidence_Score (0-100) = Weighted average of:
+
+  A) Forecast Precision (40% weight):
+     Score = max(0, 100 − (Monte_Carlo_StdDev / Intrinsic_Value × 100))
+     Narrower distribution → higher confidence
+
+  B) Model Agreement (30% weight):
+     Deviation = |DCF_Value − Relative_Value| / DCF_Value
+     Score = max(0, 100 − Deviation × 200)
+     Both models agreeing → higher confidence
+
+  C) Data Quality (20% weight):
+     Checks: Are financials available for 5+ years? Is FCF positive?
+     Are peer comparisons available (5+ peers)?
+     Score: 0-100 based on data completeness
+
+  D) Stability (10% weight):
+     How consistent are historical margins and growth rates?
+     Score: 100 − (Coefficient_of_Variation × 100), bounded 0-100
+
+  Confidence Interpretation:
+    >80: High confidence — recommendation is robust
+    50-80: Moderate confidence — use position sizing
+    30-50: Low confidence — wide range of outcomes
+    <30: Very low confidence — speculative, not actionable
+
+================================================================================
+8. PDF REPORT GENERATION
+================================================================================
+
+8.1 Design Philosophy
+--------------------------------------------------------------------------------
+The PDF report is the deliverable. It must be:
+  - Self-contained: One file that tells the complete story
+  - Professional: Looks like it came from a sell-side research desk
+  - Readable: Executive summary for skim-reading, detail for those who want it
+  - Downloadable: One-click from the Streamlit UI
+
+8.2 Report Structure (10 Sections)
+--------------------------------------------------------------------------------
+
+  SECTION 1: COVER PAGE
+  ┌─────────────────────────────────────────────┐
+  │                                             │
+  │         [Company Logo if available]         │
+  │                                             │
+  │         APPLE INC. (AAPL)                   │
+  │         Intrinsic Valuation Report          │
+  │         June 25, 2026                       │
+  │                                             │
+  │         ┌──────────────┐                    │
+  │         │     BUY      │  ← Color-coded     │
+  │         │  Confidence  │    badge:           │
+  │         │     82%      │    Green / Red /    │
+  │         └──────────────┘    Amber            │
+  │                                             │
+  │         Current Price:    $195.32           │
+  │         Intrinsic Value:  $252.80           │
+  │         Margin of Safety: +29.4%            │
+  │                                             │
+  │         Generated by Intrensic Valuator     │
+  │         research.intrensic.io               │
+  └─────────────────────────────────────────────┘
+
+  SECTION 2: EXECUTIVE SUMMARY (Page 1)
+  - Company description (1 paragraph): What they do, market position, key products
+  - Investment thesis (2-3 paragraphs): The "why" behind the recommendation
+  - Recommendation box: BUY/HOLD/SELL with confidence score, intrinsic value,
+    current price, and margin of safety — prominently displayed
+  - One-line takeaways from each analysis layer:
+      Country:  "Stable US macro with moderating rates tailwind"
+      Industry: "Consumer tech growing at 8% CAGR, Apple premium position intact"
+      Company:  "Services mix-shift driving margin expansion, strong buybacks"
+
+  SECTION 3: KEY FINDINGS
+  Structured as bullet points grouped by layer:
+
+    Country Analysis:
+      • GDP growth forecast: 2.1% (stable, no recession signals)
+      • Inflation: 2.8%, trending toward Fed's 2% target
+      • Country Risk Premium: 0 bps (US is benchmark)
+      • Key risk: Fiscal deficit trajectory remains a concern
+
+    Industry Analysis:
+      • Industry TAM: $2.8T, growing at 7.5% CAGR
+      • Competitive intensity: Moderate (differentiated products)
+      • Industry beta (unlevered): 1.15
+      • Key risk: Regulatory pressure on app store economics
+
+    Company Analysis:
+      • Revenue growth est: 6.5% CAGR (next 5 years)
+      • FCF margin est: 28% (steady-state)
+      • Moat width: Wide (ecosystem lock-in, brand, switching costs)
+      • ROIC: 42% vs WACC 9.2% = strong value creation
+      • Key risk: China exposure (~19% of revenue)
+
+  SECTION 4: VALUATION SUMMARY TABLE
+  ┌────────────────────────────────────────────┐
+  │ Metric                    │ Value          │
+  ├────────────────────────────┼────────────────┤
+  │ Current Share Price       │ $195.32        │
+  │ Intrinsic Value (Base)    │ $252.80        │
+  │ Margin of Safety          │ +29.4%         │
+  │ Fair Value Range          │ $198 - $315    │
+  │ WACC (Discount Rate)      │ 9.2%           │
+  │ Terminal Growth Rate      │ 2.5%            │
+  │ Terminal Value % of EV    │ 68%             │
+  │ DCF Implied Value         │ $258.20        │
+  │ Relative Valuation        │ $241.50        │
+  │ Blended Intrinsic Value   │ $252.80        │
+  │ Recommendation            │ BUY            │
+  │ Confidence Score          │ 82 / 100       │
+  └────────────────────────────────────────────┘
+
+  SECTION 5: DCF PROJECTION TABLE
+  Year-by-year breakdown showing how the valuation builds up:
+
+  ┌──────┬──────────┬──────────┬─────────┬────────────┬──────────────┐
+  │ Year │ Revenue  │ FCF      │ FCF     │ Discount   │ PV of FCF    │
+  │      │ Growth   │ Margin   │ ($M)    │ Factor     │ ($M)         │
+  ├──────┼──────────┼──────────┼─────────┼────────────┼──────────────┤
+  │ TTM  │    —     │  27.5%   │ $105,200│    —       │     —        │
+  │  1   │  8.0%    │  28.0%   │ $113,702│  0.9158    │  $104,128    │
+  │  2   │  7.5%    │  28.0%   │ $121,243│  0.8386    │  $101,671    │
+  │  3   │  7.0%    │  28.0%   │ $128,095│  0.7680    │   $98,382    │
+  │  4   │  6.5%    │  27.5%   │ $131,498│  0.7033    │   $92,486    │
+  │  5   │  6.0%    │  27.5%   │ $136,824│  0.6440    │   $88,111    │
+  ├──────┼──────────┼──────────┼─────────┼────────────┼──────────────┤
+  │ TV   │  2.5%     │  27.5%   │   —     │  0.6440    │ $2,089,420  │
+  └──────┴──────────┴──────────┴─────────┴────────────┴──────────────┘
+
+  Enterprise Value: $2,574,198M
+  Less Net Debt: ($62,500M)
+  Equity Value: $2,636,698M
+  Shares Outstanding: 10,430M
+  Intrinsic Value / Share: $252.80
+
+  SECTION 6: SCENARIO ANALYSIS
+  ┌─────────────────────────────────────────────────────────┐
+  │ Scenario   │ Rev Growth │ FCF Margin │ WACC │ IV/Share │
+  ├────────────┼────────────┼────────────┼──────┼──────────┤
+  │ 🟢 Bull    │   9.0%     │   29.5%    │ 8.2% │ $362.40  │
+  │ 🟡 Base    │   7.0%     │   28.0%    │ 9.2% │ $252.80  │
+  │ 🔴 Bear    │   4.5%     │   25.0%    │ 10.5%│ $152.10  │
+  └─────────────────────────────────────────────────────────┘
+
+  Probability-weighted expected value: $261.30
+
+  SECTION 7: MONTE CARLO SIMULATION CHART
+  - Histogram of 10,000 simulated intrinsic values
+  - Vertical lines at: Current Price, Base Case IV, 10th/90th percentile
+  - Normal distribution overlay
+  - Statistics box: Mean, Median, Std Dev, Skewness
+
+  SECTION 8: RELATIVE VALUATION (PEER COMPARISON)
+  ┌──────────────────┬────────┬───────────┬─────────┬─────────┐
+  │ Peer             │ Mkt Cap│ P/E (TTM) │ EV/EBITDA│ P/B    │
+  ├──────────────────┼────────┼───────────┼─────────┼─────────┤
+  │ Apple (AAPL)     │ $3.1T  │   31.2    │  22.8   │ 46.5   │
+  │ Microsoft (MSFT) │ $3.2T  │   35.6    │  24.3   │ 14.2   │
+  │ Google (GOOGL)   │ $2.4T  │   26.8    │  18.5   │  8.6   │
+  │ Amazon (AMZN)    │ $2.1T  │   44.2    │  19.2   │  9.4   │
+  │ Meta (META)      │ $1.5T  │   25.4    │  15.1   │  8.8   │
+  ├──────────────────┼────────┼───────────┼─────────┼─────────┤
+  │ Peer Median      │  —     │   31.2    │  19.2   │  9.4   │
+  │ Implied IV/Share │  —     │  $238.50  │ $244.40 │ $310*  │
+  └──────────────────┴────────┴───────────┴─────────┴─────────┘
+  *P/B excluded from average: outlier (asset-light tech)
+
+  Relative Valuation Average: $241.45
+  Blended (70% DCF / 30% Relative): $252.80
+
+  SECTION 9: RISK FACTORS
+  Top 5 risks identified by the agents, ranked by potential impact:
+  1. [HIGH] China revenue concentration — 19% revenue exposed to geopolitical risk
+  2. [MEDIUM] App Store regulation — EU DMA could reduce services margin by 200 bps
+  3. [MEDIUM] AI competition — competitors catching up in on-device AI
+  4. [LOW] Supply chain disruption — Taiwan/TSMC dependency
+  5. [LOW] Maturation of iPhone upgrade cycle
+
+  SECTION 10: DISCLAIMER
+  Standard legal disclaimer:
+  - This is not financial advice
+  - Past performance does not guarantee future results
+  - AI-generated analysis; human review recommended
+  - Data sourced from public filings and market data APIs
+  - May contain errors or omissions
+  - Always do your own research before investing
+
+8.3 PDF Generation Technical Approach
+--------------------------------------------------------------------------------
+
+  Library: reportlab (pure Python PDF generation)
+  Why reportlab:
+    - No external dependencies (no LaTeX, no wkhtmltopdf)
+    - Full control over layout and typography
+    - Tables with styling (colspan, rowspan, alternating colors)
+    - Vector graphics support
+    - Embed PNG images (for matplotlib charts)
+    - Open source, BSD license
+
+  Charts: matplotlib
+    - Monte Carlo histogram → PNG → embedded in PDF
+    - DCF waterfall chart (optional)
+    - Scenario comparison bar chart
+
+  Architecture:
+    class PDFReportGenerator:
+        def __init__(self, valuation_state: ValuationState):
+            self.state = valuation_state
+            self.story = []  # reportlab Platypus story (flowable list)
+
+        def build_cover_page(self) -> list[Flowable]:
+            # Logo (if available), company name, date, recommendation badge
+
+        def build_executive_summary(self) -> list[Flowable]:
+            # Company description, investment thesis, recommendation box
+
+        def build_key_findings(self) -> list[Flowable]:
+            # Bullet-point findings grouped by layer
+
+        def build_valuation_summary(self) -> list[Flowable]:
+            # Key metrics table
+
+        def build_dcf_projection(self) -> list[Flowable]:
+            # Year-by-year DCF table
+
+        def build_scenario_analysis(self) -> list[Flowable]:
+            # Bull/Base/Bear scenario table
+
+        def build_monte_carlo_chart(self) -> list[Flowable]:
+            # Generate histogram with matplotlib → embed Image flowable
+
+        def build_peer_comparison(self) -> list[Flowable]:
+            # Peer multiples table
+
+        def build_risk_factors(self) -> list[Flowable]:
+            # Numbered risk list
+
+        def build_disclaimer(self) -> list[Flowable]:
+            # Legal text
+
+        def generate(self, output_path: str) -> str:
+            # Assemble all sections, build PDF, return file path
+            doc = SimpleDocTemplate(output_path, pagesize=A4, ...)
+            self.story = []
+            self.story.extend(self.build_cover_page())
+            self.story.extend(self.build_executive_summary())
+            # ... all sections ...
+            self.story.extend(self.build_disclaimer())
+            doc.build(self.story)
+            return output_path
+
+  Styling:
+    - Page size: A4 (210mm × 297mm)
+    - Margins: 20mm all sides
+    - Primary font: Helvetica (built into reportlab, no font files needed)
+    - Headers: Helvetica-Bold, 14pt (section), 18pt (cover title)
+    - Body text: Helvetica, 10pt
+    - Table headers: Helvetica-Bold, 9pt, white on dark background
+    - Table cells: Helvetica, 9pt, alternating row colors (#F5F5F5 / white)
+    - Recommendation badge colors:
+        BUY  → #1B5E20 (dark green) background, white text
+        SELL → #B71C1C (dark red) background, white text
+        HOLD → #E65100 (dark amber) background, white text
+    - Footer: Page X of Y, generated timestamp, disclaimer snippet
+
+8.4 UI Integration (Streamlit)
+--------------------------------------------------------------------------------
+  In the Streamlit app:
+    1. User enters ticker → clicks "Analyze"
+    2. Pipeline runs, results display on-screen
+    3. "Download PDF Report" button appears at top of results
+    4. Click → PDF generated server-side → browser download triggers
+    5. PDF filename: {TICKER}_Valuation_Report_{YYYY-MM-DD}.pdf
+
+  Streamlit download button implementation:
+    ```python
+    import streamlit as st
+    from src.report.pdf_generator import PDFReportGenerator
+
+    # After valuation completes...
+    generator = PDFReportGenerator(valuation_state)
+    pdf_path = generator.generate(f"/tmp/{ticker}_report.pdf")
+
+    with open(pdf_path, "rb") as f:
+        st.download_button(
+            label="📥 Download PDF Report",
+            data=f,
+            file_name=f"{ticker}_Valuation_Report_{date.today()}.pdf",
+            mime="application/pdf",
+            type="primary"  # Makes it a prominent colored button
+        )
+    ```
+
+8.5 Phase Integration
+--------------------------------------------------------------------------------
+  PDF generation is built in Phase 4 alongside the UI:
+    - Task: Implement PDFReportGenerator class with all 10 sections
+    - Task: Implement chart generation (Monte Carlo histogram, scenario bar chart)
+    - Task: Wire download button into Streamlit UI
+    - Task: Test PDF output with sample stocks, verify formatting
+
+================================================================================
+9. IMPLEMENTATION PHASES
+================================================================================
+
+PHASE 1: Foundation (Data Layer + Basic DCF) — ✅ COMPLETE
+--------------------------------------------------------------------------------
+Duration: ~1 week
+Goal: Working DCF calculator with manual inputs, no AI yet
+
+Tasks:
+  1. ✅ Set up project structure (all directories, __init__.py files, .gitignore)
+  2. ✅ Create requirements.txt and install core dependencies
+     (python-dotenv, rich, pandas, numpy, requests-cache installed)
+  3. ✅ Implement YahooFinanceFetcher class (yfinance wrapper)
+     - fetch_financials(ticker) → IS, BS, CF as pandas DataFrames
+     - fetch_price_data(ticker) → price history, current price, beta
+     - fetch_company_info(ticker) → sector, industry, market cap, shares
+     - fetch_peer_companies(ticker) → list of peer tickers
+     - Added fuzzy field-name matching for yfinance compatibility
+  4. ✅ Implement MacroFetcher class (FRED + World Bank)
+     - fetch_risk_free_rate() → 10Y US Treasury yield
+     - fetch_gdp_growth(country) → GDP growth data
+     - fetch_inflation(country) → CPI/inflation data
+  5. ✅ Implement caching layer (dual-layer: application + HTTP)
+     - DataCache class: SQLite-backed, thread-safe, TTL-driven, JSON serializer
+       handles numpy + pandas types, lazy eviction, WAL mode, stats()
+     - http_cache module: requests-cache CachedSession with per-URL-pattern TTLs,
+       stale-if-error, singleton get_http_session()
+     - TTLs: PRICE=1d, FINANCIALS=7d, RATES=7d, GDP=30d, ESTIMATES=7d
+  6. ✅ Build DCFModel class
+     - calculate_fcf(financials) → base FCF
+     - project_fcf(base_fcf, growth_rates, margins, years) → FCF array
+     - calculate_terminal_value(final_fcf, wacc, terminal_growth) → TV
+     - discount_cashflows(fcf_array, tv, wacc) → enterprise_value
+     - calculate_equity_value(ev, debt, cash, shares) → intrinsic value/share
+  7. ✅ Build WACCCalculator class
+     - calculate_cost_of_equity(rf, beta, erp, crp, size_premium) → Re
+     - estimate_credit_spread(financials) → spread from synthetic rating
+     - calculate_cost_of_debt(rf, spread, tax_rate) → Rd
+     - calculate_wacc(Re, Rd, equity_value, debt_value) → WACC
+  8. ✅ Build RelativeValuation class
+     - fetch_peer_financials(peer_tickers) → peer metrics
+     - calculate_fair_value_pe(peer_pe, company_eps) → fair value
+     - calculate_fair_value_ev_ebitda(peer_multiple, company_ebitda) → fair EV
+  9. ✅ Create CLI interface in main.py
+     - Accept ticker and manual assumptions → output intrinsic value
+  10. ✅ Write unit tests for DCF and WACC calculations (21 + 24 tests)
+
+PHASE 2: Enhanced Valuation (Scenario + Monte Carlo) — ✅ COMPLETE
+--------------------------------------------------------------------------------
+Duration: ~1 week
+Goal: Robust valuation with uncertainty quantification
+
+Tasks:
+  1. ✅ Implement ScenarioAnalysis class
+     - Define bull/base/bear scenario templates with growth, margin, WACC offsets
+     - Run DCF for each scenario
+     - Output scenario comparison table with all key inputs
+  2. ✅ Implement MonteCarloSimulation class
+     - Define normal distributions for each input (growth, margin, WACC, terminal)
+     - Run N iterations (default 5,000; parameterized for 10,000)
+     - Output distribution statistics (mean, median, percentiles, skewness)
+     - Generate histogram via matplotlib in PDF report
+  3. ✅ Implement SEC EDGAR fetcher (verification layer)
+     - Fetch 10-K XBRL data for specific ticker via SEC REST API
+     - Cross-check yfinance data against SEC filings with discrepancy reporting
+     - CIK lookup + US-GAAP concept mapping
+  4. ✅ Add comprehensive logging (Rich-based structured logging)
+  5. ✅ Write tests for Monte Carlo (11 tests) and scenarios
+
+PHASE 3: Agentic AI Integration — ✅ COMPLETE
+--------------------------------------------------------------------------------
+Duration: ~1.5 weeks
+Goal: LLM-powered agents feeding the valuation engine
+
+Tasks:
+  1. ✅ Design Pydantic state models for LangGraph
+     - ValuationState (full state schema with 40+ fields)
+  2. ✅ Write system prompts for each agent
+     - Country analysis prompt with CRP framework and output schema
+     - Industry analysis prompt with Porter's 5 Forces and beta guidance
+     - Company analysis prompt with moat/management/financial health scoring
+     - Recommendation prompt with confidence scoring and override logic
+  3. ✅ Implement LangGraph orchestrator
+     - Define graph with nodes and edges (linear pipeline)
+     - Sequential fallback when LangGraph compilation fails
+     - State flows Country → Industry → Company → Valuation → Recommendation
+  4. ✅ Build tool definitions for agents
+     - yfinance fetcher tool (via YahooFinanceFetcher)
+     - Web search tool (DuckDuckGo via duckduckgo-search)
+     - FRED data tool (via MacroFetcher)
+  5. ✅ Implement each agent node
+     - CountryAgent: LLM + FRED + web search → country analysis
+     - IndustryAgent: LLM + yfinance + web → industry analysis
+     - CompanyAgent: LLM + yfinance + web → company analysis
+  6. ✅ Wire agents to Valuation Engine
+     - Agent outputs → populate DCF inputs (growth rates, margins, WACC)
+     - Uses actual financial data defaults when LLM is unavailable
+     - Run valuation automatically after company agent
+  7. ✅ Implement RecommendationAgent
+     - Takes valuation results + all narratives
+     - Produces final BUY/SELL/HOLD with confidence score
+     - Falls back to quantitative rule when LLM unavailable
+  8. ✅ End-to-end testing with known stocks (AAPL, MSFT, GOOGL, META)
+     - Pipeline verified with multiple tickers
+
+PHASE 4: Polish & Production-Ready — ✅ COMPLETE (except backtesting)
+--------------------------------------------------------------------------------
+Duration: ~1 week
+Goal: Usable, tested, documented system with professional PDF reports
+
+Tasks:
+  1. ✅ Build PDF Report Generator (src/report/pdf_generator.py)
+     - Implemented PDFReportGenerator class with reportlab
+     - 10-section report: cover page, executive summary, key findings,
+       valuation summary table, DCF projection table, scenario analysis,
+       Monte Carlo histogram (matplotlib), peer comparison, risk factors,
+       disclaimer
+     - Color-coded recommendation badge (BUY=green, SELL=red, HOLD=amber)
+     - Verified: 10-page PDF, 99KB, valid PDF header
+  2. ✅ Build chart generation (src/report/charts.py)
+     - Monte Carlo distribution histogram with percentile lines
+     - Scenario comparison bar chart (Bull/Base/Bear)
+  3. ✅ Build Streamlit UI (app.py)
+     - Input: Ticker or company name with "Analyze" button
+     - Results dashboard: recommendation badge, key metrics, narratives
+     - "Download PDF Report" button with browser download
+     - PDF filename: {TICKER}_Valuation_Report_{YYYY-MM-DD}.pdf
+  4. 📋 Backtesting framework (future enhancement)
+  5. ✅ Error handling and edge cases
+     - Graceful degradation when LLM unavailable (uses data defaults)
+     - Missing data handling in yahoo_fetcher (returns 0.0 for missing fields)
+     - Unknown ticker handling (pipeline continues with empty data)
+  6. ✅ Comprehensive testing
+     - 78 unit tests for all calculation modules
+     - 12 integration tests for full pipeline, data fetchers, PDF generation
+     - PDF output validation (file size, PDF header, content checks)
+  7. ✅ Documentation
+     - Claude.md with full architecture, deviations, testing
+     - Plan.txt with implementation status and test details
+     - README (see Claude.md project description)
+
+================================================================================
+10. RISKS & MITIGATIONS
+================================================================================
+
+  Risk 1: LLM Hallucination in Financial Numbers
+    Mitigation: Every numeric output from an LLM agent is validated against
+    known data sources (yfinance, SEC). The Valuation Engine uses only
+    validated numbers. The LLM provides DIRECTIONAL adjustments to a base
+    of hard financial data — it never generates financial numbers from scratch.
+
+  Risk 2: DCF Terminal Value Dominance
+    Mitigation: Cross-validate with relative valuation. Flag when TV >70% of
+    total EV in the report. Use exit multiple method as sanity check.
+
+  Risk 3: Garbage In, Garbage Out (Data Quality)
+    Mitigation: Data quality scoring in confidence calculation. If financial
+    data is sparse or inconsistent, confidence score drops and recommendation
+    is caveated. SEC EDGAR serves as ground truth for US stocks.
+
+  Risk 4: Model Drift Over Time
+    Mitigation: Regular backtesting against actual price movements. If
+    recommendation accuracy degrades, recalibrate agent prompts and ranges.
+
+  Risk 5: Rate Limits on Free APIs
+    Mitigation: Aggressive caching. Financial data TTLs are long (daily to
+    monthly). Cache hit rate should be >90% for repeat valuations.
+
+================================================================================
+11. SUCCESS METRICS
+================================================================================
+
+  - DCF model matches within ±10% of manual Excel DCF for same inputs
+  - Agent-generated WACC components (CRP, beta) within ±20% of professional
+    data sources (Damodaran, KPMG, Kroll)
+  - End-to-end pipeline produces recommendation in <30 seconds
+  - Backtest: BUY recommendations outperform market by 5%+ over 12 months
+  - Recommendations match professional analyst consensus direction >60% of time
+    (disagreement is okay — the AI should find opportunities analysts miss)
+
+================================================================================
+12. FUTURE ENHANCEMENTS (v2+)
+================================================================================
+
+  - Real-time news ingestion affecting conviction scores
+  - Earnings call transcript analysis (NLP on management tone)
+  - Insider trading monitoring
+  - ESG risk integration
+  - Multi-currency support and FX-adjusted returns
+  - Portfolio-level optimization (not just individual stock picks)
+  - Custom user risk profiles (aggressive/moderate/conservative)
+  - Integration with brokerage APIs for automated trading signals
+
+================================================================================
+13. IMPLEMENTATION DEVIATIONS
+================================================================================
+
+The following deviations from the original plan were made during implementation.
+Each is intentional and documented for transparency.
+
+13.1 LangGraph Compatibility & Sequential Fallback
+--------------------------------------------------------------------------------
+  Plan:   LangGraph StateGraph compiles directly with ValuationState(dict).
+  Actual: The custom dict subclass caused 'ticker' KeyError during invoke().
+          Added a sequential fallback pipeline that runs each agent node
+          function in order. The LangGraph graph is still built and attempted;
+          if it fails, execution proceeds sequentially.
+
+  Impact:  More robust — works regardless of LangGraph version. No loss of
+           functionality since the pipeline was linear (no branching needed).
+
+13.2 Raw sqlite3 Instead of sqlitedict
+--------------------------------------------------------------------------------
+  Plan:   Use sqlitedict library for application-level caching.
+  Actual: Used Python's built-in sqlite3 module. sqlitedict was removed from
+          requirements.txt and Claude.md dependency list.
+
+  Why:    Eliminates a dependency. Gives finer control over WAL mode, busy
+          timeout, table schema, stats tracking. The DataCache class is more
+          featureful (hit/miss counters, explicit expire(), clear()).
+
+13.3 Monte Carlo Iterations (5k vs 10k)
+--------------------------------------------------------------------------------
+  Plan:   10,000 iterations.
+  Actual: Default 5,000 with comment: "5k for speed; use 10k for production".
+          The MonteCarloSimulation class accepts iterations as a parameter.
+
+  Why:    Faster CLI feedback during development. Users can pass --iterations
+          for higher precision.
+
+13.4 yfinance Field Name Aliasing
+--------------------------------------------------------------------------------
+  Plan:   Direct field name lookups in yfinance DataFrames (e.g.,
+          "Operating Cash Flow").
+  Actual: yfinance uses different field names across stocks and statement
+          types. Added fuzzy-match alias dict in _get_latest() that maps our
+          canonical names to multiple possible yfinance names.
+
+  Example: "Operating Cash Flow" maps to ["Operating Cash Flow",
+           "Cash Flow From Continuing Operating Activities",
+           "Net Cash Provided By Operating Activities"].
+
+13.5 No .env.example File
+--------------------------------------------------------------------------------
+  Plan:   Create .env.example as a template for required keys.
+  Actual: Only .env exists (gitignored). Key documentation is in Section 3.1.
+
+13.6 Agent Architecture Simplification
+--------------------------------------------------------------------------------
+  Plan:   Individual LangGraph agent classes in src/agents/ (country_agent.py,
+          industry_agent.py, company_agent.py, etc.).
+  Actual: Agent prompts in src/prompts/ as standalone modules. Agent logic
+          (LLM calls, parsing, state updates) lives in orchestrator.py node
+          functions. The src/agents/ directory has only __init__.py.
+
+  Why:    Cleaner — one orchestrator to maintain vs 5 agent class files.
+          The prompts are still modular and independently editable.
+
+13.7 Shares Outstanding Units
+--------------------------------------------------------------------------------
+  Plan:   Shares outstanding in millions.
+  Actual: yfinance returns raw share count (e.g., 14,687,356,000 for AAPL).
+          The DCF model divides equity value by this raw count. Math is
+          consistent across all calculations.
+
+================================================================================
+14. TESTING
+================================================================================
+
+14.1 Test Structure
+--------------------------------------------------------------------------------
+  tests/
+  ├── __init__.py
+  ├── test_data_cache.py        # 17 unit tests
+  ├── test_dcf_model.py         # 21 unit tests
+  ├── test_wacc.py              # 24 unit tests
+  ├── test_relative_val.py      # 11 unit tests
+  ├── test_monte_carlo.py       # 11 unit tests
+  └── test_integration.py       # 12 integration tests
+
+  Total: 90 tests (78 unit + 12 integration)
+
+14.2 Running Tests
+--------------------------------------------------------------------------------
+  # All unit tests (no network, < 3 seconds)
+  pytest tests/ -m "not integration" -v
+
+  # Full suite including integration (needs network, ~20 seconds)
+  pytest tests/ -v
+
+  # Single file
+  pytest tests/test_dcf_model.py -v
+
+14.3 Test Markers
+--------------------------------------------------------------------------------
+  @pytest.mark.integration — requires network access (yfinance, FRED, SEC).
+  Skip with: pytest -m "not integration"
+
+14.4 Coverage by Module
+--------------------------------------------------------------------------------
+  Module              Tests   Type          What's Covered
+  ─────────────────   ─────   ────          ─────────────
+  data_cache.py        17     Unit          CRUD, TTL, numpy/pandas serialization, stats
+  dcf_model.py         21     Unit          FCF calc, projection, terminal value, discount, full pipeline
+  wacc_calculator.py   24     Unit          Credit spread, size premium, beta lever/unlever, WACC components
+  relative_val.py      11     Unit          P/E, EV/EBITDA, P/B, blended, peer medians, edge cases
+  monte_carlo.py       11     Unit          Distribution stats, reproducibility, scenario analysis
+  integration           12     Integration   Full pipeline (AAPL, MSFT, GOOGL, META), data fetchers, PDF
+
+14.5 What's NOT Tested (Manual Verification)
+--------------------------------------------------------------------------------
+  - Streamlit UI rendering (requires browser)
+  - DeepSeek LLM agent calls (requires API key + credits)
+  - Edge cases with all possible ticker/industry combinations
+  - Long-running Monte Carlo convergence (>5k iterations)
+  - PDF visual appearance and formatting
+
+================================================================================
+END OF PLAN
+================================================================================
