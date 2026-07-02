@@ -1,5 +1,4 @@
-================================================================================
-                    INTRENSIC-VALUATOR — IMPLEMENTATION PLAN
+INTRENSIC-VALUATOR — IMPLEMENTATION PLAN
 ================================================================================
 
 1. EXECUTIVE SUMMARY
@@ -111,14 +110,15 @@ A. yfinance (Yahoo Finance)
           shares outstanding, beta, industry/sector classification, peers
    - Why: Most comprehensive free source for US stocks. Covers 99% of what
           we need for financial statement data.
-   - How: Python library. Pull FCF from cash flow statement line items
+   - How: Pull FCF from cash flow statement line items
           (Operating Cash Flow - Capital Expenditure), NOT from info dict.
           The info['freeCashflow'] field is known to be unreliable in yfinance.
    - Rate limits: None officially, but use caching to be respectful.
 
 B. SEC EDGAR (XBRL API)
    - What: Raw 10-K and 10-Q filings with structured financial data
-   - Why: Most accurate and auditable source. Used as verification layer.
+   - Why: Most accurate and auditable source. Used as verification layer
+          and as the primary source for true Diluted Shares Outstanding.
    - How: HTTP GET to SEC EDGAR API, parse XBRL-JSON or use edgartools library.
           Maps XBRL concepts (us-gaap taxonomy) to our financial model fields.
    - Rate limits: 10 requests/second. Very generous.
@@ -144,9 +144,9 @@ D. World Bank API (via wbgapi)
 
 E. Financial Modeling Prep (FMP)
    - What: Analyst consensus estimates, pre-computed DCF, treasury rates,
-          market risk premium data, enterprise values
+          market risk premium data, enterprise values, peer trading multiples.
    - Why: Analyst estimates provide a useful sanity check against our AI-generated
-          projections. Pre-computed DCF can serve as a benchmark.
+          projections. Essential fallback when yfinance peer data returns NaNs.
    - How: REST API with API key. Free tier: 250 requests/day.
    - URL: https://financialmodelingprep.com/developer/docs/
 
@@ -157,7 +157,7 @@ F. Alpha Vantage
    - How: REST API with API key. Free tier: 25 requests/day.
    - URL: https://www.alphavantage.co/
 
-4.3 Data Caching Strategy ✅ IMPLEMENTED
+4.3 Data Caching Strategy
 --------------------------------------------------------------------------------
 
 A dual-layer caching system prevents redundant API calls during development and
@@ -259,12 +259,30 @@ The projection embeds the top-down analysis directly into the numbers:
   Revenue_Year_N = Revenue_Base × Π(i=1 to N) (1 + Growth_Rate_i)
 
   Where Growth_Rate_i starts at the company-specific rate (from Company Agent),
-  then decays toward the industry rate (from Industry Agent), and finally
-  toward the terminal growth rate (from Country Agent).
+  then systematically decays sequentially toward the industry rate (from Industry Agent),
+  and finally toward the terminal growth rate (from Country Agent).
 
-  Decay formula: Growth_Rate_i = Company_Growth + (i/5) × (Industry_Growth − Company_Growth)
-  for years 1-3, then Industry_Growth + ((i-3)/2) × (Terminal_Growth − Industry_Growth)
-  for years 4-5.
+  To avoid mathematical discontinuity jumps between phases while preserving the
+  three-layer top-down framework, a continuous piecewise linear decay (3-knot spline)
+  is applied across the 5-year explicit horizon:
+
+    Knot 0 (Year 0): Company_Growth        ← Firm-specific starting point
+    Knot 1 (Year 3): Industry_Growth       ← Industry-anchored midpoint
+    Knot 2 (Year 5): Terminal_Growth       ← Long-run macro steady state
+
+  The growth rate for each projection year i is:
+
+    For i = 1, 2, 3:
+      Growth_Rate_i = Company_Growth + (i / 3) × (Industry_Growth − Company_Growth)
+
+    For i = 4, 5:
+      Growth_Rate_i = Industry_Growth + ((i − 3) / 2) × (Terminal_Growth − Industry_Growth)
+
+  At i = 3, both segments evaluate to Industry_Growth — the transition is seamless.
+  This embeds the top-down logic directly: the company's growth converges to the
+  industry norm by year 3, then the industry rate decays toward the terminal
+  long-run GDP growth rate by year 5. No one-step jump from Company to Terminal
+  ever occurs; Industry acts as the structurally necessary intermediate anchor.
 
   FCF_Year_N = Revenue_Year_N × FCF_Margin_Year_N
 
@@ -293,7 +311,6 @@ discount future cash flows.
      Equity Risk Premium (ERP):
        - Default: 5.0% for developed markets, higher for emerging
        - Source: Can be estimated from FMP or use Damodaran's published ERP
-         (Aswath Damodaran at NYU publishes this annually — widely used standard)
        - Typical ranges: US 4.5-5.5%, Emerging Markets 6-9%
 
      Industry Beta:
@@ -301,7 +318,9 @@ discount future cash flows.
          use Damodaran's industry beta tables (published by sector)
        - If using peer betas: Median unlevered beta of 5-10 industry peers,
          then relevered to the company's own D/E ratio
-       - Hamada formula: β_levered = β_unlevered × [1 + (1 − Tax) × (D/E)]
+       - Hamada formula: β_levered = β_unlevered × [1 + (1 − Statutory_Tax_Rate) × (D/E)]
+         *NOTE: Statutory tax rate is utilized here instead of Effective tax rate to avoid
+         artificially over-levering or under-levering companies due to short-term tax anomalies.
 
      Country Risk Premium (CRP):
        - Source: Country Agent analysis
@@ -321,7 +340,7 @@ discount future cash flows.
        - Only apply when market cap < $2B
 
   B) Cost of Debt:
-     Cost_of_Debt = (Risk_Free_Rate + Credit_Spread) × (1 − Tax_Rate)
+     Cost_of_Debt = (Risk_Free_Rate + Credit_Spread) × (1 − Statutory_Tax_Rate)
 
      Credit_Spread:
        - Estimated from company's credit rating, interest coverage ratio,
@@ -337,15 +356,16 @@ discount future cash flows.
          - ICR < 2.5 → CCC+ (~8%+)
 
      Tax Rate:
-       - Use effective tax rate from income statement (Tax / Pre-Tax Income)
-       - Or statutory corporate tax rate for the country
+       - Use Statutory Corporate Tax Rate for the base country to ensure stability in the
+         long-term structural cost of capital components.
 
   C) Capital Structure Weights (E/V and D/V):
-     - E/V = Market_Cap / (Market_Cap + Total_Debt)
-     - D/V = Total_Debt / (Market_Cap + Total_Debt)
-     - Use MARKET values, not book values
-     - Market Cap = Current Price × Shares Outstanding
-     - Total Debt = Short-term Debt + Long-term Debt (from balance sheet)
+     - E/V = Market_Cap / (Market_Cap + Total_Debt_Proxy)
+     - D/V = Total_Debt_Proxy / (Market_Cap + Total_Debt_Proxy)
+     - Market Cap = Current Price × Diluted Shares Outstanding
+     - Total Debt Proxy = Short-term Debt + Long-term Debt (from balance sheet)
+       *NOTE: Book value of debt is used as a pragmatic and industry-standard proxy 
+       for the market value of debt since true debt market valuations are untraded/unobtainable.
 
 5.4 Terminal Value
 --------------------------------------------------------------------------------
@@ -376,6 +396,7 @@ We calculate TWO methods and use the average:
                  + Investments_in_Associates
 
   Intrinsic_Value_Per_Share = Equity_Value / Diluted_Shares_Outstanding
+  *NOTE: Diluted Shares Outstanding must be validated via SEC layer to avoid basic-share bias.
 
 5.6 Relative Valuation (Sanity Check)
 --------------------------------------------------------------------------------
@@ -390,6 +411,7 @@ DCF is sensitive to assumptions. We cross-validate with relative valuation:
     - Similar market cap (±50%)
     - Similar revenue size
     - Min 5 peers, ideally 8-12
+    - Fallback: If yfinance fields return NaNs, automatically call FMP/Alpha Vantage API
 
   Final check: If DCF intrinsic value deviates >50% from relative valuation
   median, flag a "model disagreement" warning and widen confidence interval.
@@ -438,7 +460,7 @@ LLM agents can do all of this — IF you give them the right tools, prompts, and
 structured output formats. They don't replace the quantitative model; they feed
 its inputs.
 
-6.2 Orchestrator Architecture (LangGraph)
+6.2 Orchestrator Architecture (LangGraph with Sequential Fallback)
 --------------------------------------------------------------------------------
 We use LangGraph to build a directed graph of agent nodes. Each node is an
 LLM call with specific tools and a structured output schema.
@@ -446,6 +468,13 @@ LLM call with specific tools and a structured output schema.
   State flows:
     START → CountryAgent → IndustryAgent → CompanyAgent
           → ValuationEngine → RecommendationAgent → END
+
+  CRITICAL ROBUSTNESS GUARDRAIL:
+  If a graph compilation or run execution runtime failure occurs (such as versioning
+  incompatibilities, missing state keys, or LangGraph infrastructure anomalies),
+  the system executes a **Sequential Fallback Mechanism**. This runs each node 
+  function as a standard Python execution chain, passing the unified state 
+  dictionary sequentially down the pipeline, guaranteeing absolute fault tolerance.
 
   Each node:
     1. Receives the full state (all prior analysis)
@@ -519,8 +548,11 @@ LLM call with specific tools and a structured output schema.
       cost advantage, intangible assets
     - Growth drivers: New products, geographic expansion, pricing power,
       acquisitions
-    - Risk factors: Customer concentration, key person risk, litigation,
-      obsolescence
+    - Risk factors: Idiosyncratic risk factors only (customer concentration, 
+      key person risk, litigation, product obsolescence).
+      *CRITICAL WORKFLOW GUARDRAIL: The Company Agent prompt explicitly forbids
+      penalizing or adding premium for systemic macro/country-level problems 
+      (e.g. general inflation or country risks) to eliminate Double-Counting Risk.
     - Financial statement red flags: Aggressive revenue recognition,
       frequent one-time charges, growing DSO, inventory build
   Outputs:
@@ -578,34 +610,28 @@ LLM call with specific tools and a structured output schema.
 6.4 How Qualitative Becomes Quantitative (The Core Innovation)
 --------------------------------------------------------------------------------
 This is the hardest problem in automated valuation: converting text analysis
-into numbers that feed the DCF model. Here's the approach for each conversion:
+into numbers that feed the DCF model. To mitigate LLM "hallucinated precision" 
+and arbitrary number assignment, agents select from discrete categorical intervals 
+mapped back to fixed quantitative variables.
 
   CONVERSION TABLE:
   ═══════════════════════════════════════════════════════════════════════
-  Qualitative Assessment          →  Quantitative Parameter     Range
+  Qualitative Classification      →  Quantitative Parameter     Interval Mapping
   ═══════════════════════════════════════════════════════════════════════
-  Country political stability     →  Country Risk Premium       0-1500 bps
-  Currency risk assessment        →  Additional discount        0-500 bps
-  Industry competitive intensity  →  FCF margin pressure        −500 to 0 bps
-  Regulatory risk                 →  Beta adjustment            ±0.2
-  Disruption risk                 →  Terminal growth modifier   ±1.0%
-  Moat width (wide/narrow/none)   →  Competitive adv. period    3-10 years
-  Management quality (1-10)       →  Execution premium/discount ±2% growth
-  Financial health (1-10)         →  Credit spread              70-800 bps
-  ROIC vs WACC gap                →  Value creation confidence  ± terminal val
+  Country political stability     →  Country Risk Premium       [0, 250, 500, 750, 1000, 1500] bps
+  Currency risk assessment        →  Additional discount        [0, 100, 250, 500] bps
+  Industry competitive intensity  →  FCF margin pressure        [0, -100, -250, -500] bps
+  Regulatory risk                 →  Beta adjustment            [-0.2, -0.1, 0.0, +0.1, +0.2]
+  Disruption risk                 →  Terminal growth modifier   [-1.0%, -0.5%, 0.0%, +0.5%]
+  Moat width                      →  Competitive adv. period    [3, 5, 7, 10] years
+  Management quality              →  Execution growth factor    [-2.0%, -1.0%, 0.0%, +1.0%, +2.0%]
+  Financial health                →  Credit spread Mapping      Fixed Synthetic Mapping (70-800 bps)
+  ROIC vs WACC gap                →  Value creation confidence  Bounds Terminal Perpetuity
   ═══════════════════════════════════════════════════════════════════════
 
-  Each conversion uses CALIBRATED RANGES — the agents can pick any value within
-  the range but must justify the choice in the narrative output. The ranges are
-  derived from financial literature and practice (Damodaran, McKinsey, CFA
-  curriculum).
-
-  Example: The Country Agent assigns a CRP of 250 bps for India. It must output:
-    "India CRP of 250 bps based on: (1) S&P rates India BBB- with stable
-    outlook, (2) India 10-year bond yields 7.1% vs US 4.2% = 290 bps spread,
-    (3) governance indicators show moderate political stability at 6.2/10,
-    (4) inflation has been moderating but remains above target at 4.8%.
-    Weighted toward bond spread with slight discount for improving trajectory."
+  Each conversion uses CALIBRATED BUCKETS — agents choose the structural category 
+  and justify their placement within the narrative output. The intervals are 
+  derived from corporate valuation literature (Damodaran, McKinsey, CFA curriculum).
 
 ================================================================================
 7. RECOMMENDATION LOGIC
@@ -754,7 +780,7 @@ The PDF report is the deliverable. It must be:
   │  3   │  7.0%    │  28.0%   │ $128,095│  0.7680    │   $98,382    │
   │  4   │  6.5%    │  27.5%   │ $131,498│  0.7033    │   $92,486    │
   │  5   │  6.0%    │  27.5%   │ $136,824│  0.6440    │   $88,111    │
-  ├──────┼──────────┼──────────┼─────────┼────────────┼──────────────┤
+  ├──────┼──────────┼──────────┼─────────┼────────────┼──────────────┐
   │ TV   │  2.5%     │  27.5%   │   —     │  0.6440    │ $2,089,420  │
   └──────┴──────────┴──────────┴─────────┴────────────┴──────────────┘
 
