@@ -52,8 +52,12 @@ User Input (Ticker / Company Name)
 │  3. COMPANY AGENT                │
 │  - Financial statement analysis  │
 │  - Management quality, moat      │
-│  - Growth drivers, risks         │
-│  - Competitive position          │
+│  - Idiosyncratic risks ONLY      │
+│    (customer concentration,      │
+│     key person, litigation)      │
+│  - Forbidden: macro/country risk │
+│    penalization (double-counting │
+│    prevention guardrail)         │
 │  Output: Revenue Growth Est.,    │
 │         FCF Margin Est.,         │
 │         Company-Specific Risk    │
@@ -102,7 +106,7 @@ User Input (Ticker / Company Name)
 | Source | Data Provided | Access Method |
 |--------|--------------|---------------|
 | **yfinance** | Stock price, financial statements (IS, BS, CF), shares outstanding, beta | Python library |
-| **SEC EDGAR (XBRL)** | 10-K/10-Q filings — revenue, OCF, capex, debt, shares | HTTP + xbrl parsing |
+| **SEC EDGAR (XBRL)** | 10-K/10-Q filings — revenue, OCF, capex, debt, diluted shares (primary source) | HTTP + xbrl parsing |
 | **FRED (St. Louis Fed)** | US Treasury yields, GDP, CPI, unemployment | `fredapi` Python library |
 | **World Bank API** | Global GDP growth, inflation, population by country | `wbgapi` Python library |
 | **Yahoo Finance (web)** | Analyst estimates, news, industry peers | Web scraping or `yfinance` |
@@ -110,7 +114,7 @@ User Input (Ticker / Company Name)
 ### Secondary (Freemium — fallback)
 | Source | Data Provided | Limits |
 |--------|--------------|--------|
-| **Financial Modeling Prep (FMP)** | Pre-computed DCF, analyst estimates, treasury rates, market risk premium | 250 req/day free |
+| **Financial Modeling Prep (FMP)** | Pre-computed DCF, analyst estimates, treasury rates, peer trading multiples (NaN fallback) | 250 req/day free |
 | **Alpha Vantage** | Income statement, balance sheet, cash flow, forex | 25 req/day free |
 | **EODHD** | Fundamentals, 60+ global markets | Free demo token |
 
@@ -220,7 +224,10 @@ Pull from cash flow statement (NOT summary metrics — yfinance `info['freeCashf
 ```
 FCF_Year_N = FCF_Base × (1 + Revenue_Growth_N) × FCF_Margin_N
 ```
-Growth rates decay from company-specific to industry to terminal growth rate over the projection period.
+Growth rates follow a continuous 3-knot linear spline:
+- **Years 1–3**: Company_Growth → Industry_Growth (firm-specific converges to sector norm)
+- **Years 4–5**: Industry_Growth → Terminal_Growth (sector decays to long-run GDP growth)
+- At year 3, both segments equal Industry_Growth — mathematically seamless transition.
 
 #### Step 3: Calculate Weighted Average Cost of Capital (WACC)
 ```
@@ -229,13 +236,20 @@ Cost of Equity (CAPM) = Rf + β_industry × ERP + CRP + SRP
 Where:
   Rf    = 10-year US Treasury yield (from FRED)
   β_industry = Median unlevered beta of industry peers, relevered to company's D/E
+          using Hamada formula with Statutory_Tax_Rate (NOT effective tax rate)
   ERP   = Equity Risk Premium (typically ~5.0-6.0%)
   CRP   = Country Risk Premium (from Country Agent analysis)
   SRP   = Size Risk Premium (if applicable)
 
-Cost of Debt = (Rf + Country_Spread + Company_Credit_Spread) × (1 − Tax_Rate)
+Cost of Debt = (Rf + Country_Spread + Company_Credit_Spread) × (1 − Statutory_Tax_Rate)
 
 WACC = (E/V) × Cost_of_Equity + (D/V) × Cost_of_Debt
+
+NOTE: E/V and D/V use Market Cap for equity and Total_Debt_Proxy (book value of
+debt from balance sheet) for debt. Book value of debt is an industry-standard proxy
+since true market values for corporate debt are not publicly traded/observable.
+Statutory tax rate is used throughout WACC and Hamada's formula to avoid distortions
+from anomalous tax years (e.g., one-off credits producing 0% effective rates).
 ```
 
 #### Step 4: Terminal Value
@@ -248,8 +262,10 @@ Where g_terminal = long-term GDP growth or 2-3% (whichever is lower).
 ```
 Enterprise_Value = Σ [FCF_t / (1 + WACC)^t] + TV / (1 + WACC)^n
 Equity_Value = Enterprise_Value − Total_Debt + Cash_and_Equivalents
-Intrinsic_Value_Per_Share = Equity_Value / Shares_Outstanding
+Intrinsic_Value_Per_Share = Equity_Value / Diluted_Shares_Outstanding
 ```
+Diluted shares are validated via SEC EDGAR XBRL filings to avoid basic-share bias
+(especially critical for companies with large option pools or convertible debt).
 
 ### Supporting: Relative Valuation
 ```
@@ -257,6 +273,11 @@ Fair_Value = Median(Peer_P/E) × Company_EPS
 Fair_Value = Median(Peer_EV/EBITDA) × Company_EBITDA
 ```
 Weight: 70% DCF, 30% Relative in final intrinsic value blend.
+
+Peer data is primarily sourced via yfinance. When yfinance returns NaN for peer
+multiples (common for smaller/international stocks), the system automatically falls
+back to Financial Modeling Prep (FMP) or Alpha Vantage APIs, which provide cleaner
+pre-calculated multiples.
 
 ### Scenario Analysis
 - **Bull Case**: Higher growth, lower WACC
@@ -419,9 +440,9 @@ intrensic-valuator/
 
 2. **yfinance as primary data source** — Free, no API key, covers all US stocks. FCF pulled from cash flow statement fields, not summary info dict.
 
-3. **LLM for qualitative → quantitative conversion** — The hardest problem in automated valuation. Each agent uses carefully engineered prompts to convert textual analysis (management quality, moat, regulatory risks) into numeric adjustments to growth rates, margins, and discount rates. Each agent MUST output structured JSON with explicit numeric fields.
+3. **LLM for qualitative → quantitative conversion** — The hardest problem in automated valuation. Each agent uses carefully engineered prompts to convert textual analysis (management quality, moat, regulatory risks) into numeric adjustments to growth rates, margins, and discount rates. To prevent hallucinated precision, agents select from **discrete categorical buckets** (e.g., Country Risk Premium can only be 0, 250, 500, 750, 1000, or 1500 bps) rather than arbitrary values within continuous ranges. Each agent MUST output structured JSON with explicit numeric fields.
 
-4. **WACC as the integration point** — All three layers (country, industry, company) feed into WACC calculation. Country → CRP. Industry → Beta. Company → specific risk premium. This is the theoretically correct way to cascade top-down risk into valuation.
+4. **WACC as the integration point** — All three layers (country, industry, company) feed into WACC calculation. Country → CRP. Industry → Beta. Company → specific risk premium. Uses **statutory tax rate** (not effective rate) in Hamada's formula and cost of debt to avoid distortions from anomalous tax years. **Book value of debt** is used as a pragmatic proxy for market value of debt, which is standard corporate finance convention since corporate bonds don't trade on public exchanges. This is the theoretically correct way to cascade top-down risk into valuation.
 
 5. **Dual-layer caching** — Two complementary caching layers prevent redundant API calls:
    - **Application cache** (`DataCache`): SQLite-backed key-value store with TTL-driven lazy eviction. Handles numpy + pandas types via custom JSON serializer. Used by fetcher modules to cache post-processed results.
@@ -546,24 +567,38 @@ Each agent call includes:
 
 ## How Qualitative Data Becomes Quantitative
 
-This is the core innovation. Each agent converts text analysis into numbers:
+This is the core innovation. Each agent converts text analysis into numbers. To prevent
+LLM "hallucinated precision" (arbitrary variance between identical runs), agents select
+from **discrete categorical buckets** rather than open-ended continuous ranges. Each
+category maps to a fixed quantitative value in Python — the LLM chooses the structural
+bucket, not the exact number.
 
-### Country Agent
-- **GDP growth trajectory** → Terminal growth rate input
-- **Political stability score (1-10)** → CRP adjustment (±0-300 bps)
-- **Currency risk assessment** → Additional discount for foreign investors
+### Conversion Table (Discrete Buckets)
 
-### Industry Agent
-- **Industry growth narrative** → Revenue growth range (low/high)
-- **Competitive intensity (Porter 5 Forces score)** → FCF margin pressure adjustment
-- **Regulatory risk** → Beta adjustment and margin of safety buffer
+| Qualitative Classification | Quantitative Parameter | Fixed Bucket Values |
+|---|---|---|
+| Country political stability | Country Risk Premium | [0, 250, 500, 750, 1000, 1500] bps |
+| Currency risk assessment | Additional discount | [0, 100, 250, 500] bps |
+| Industry competitive intensity | FCF margin pressure | [0, -100, -250, -500] bps |
+| Regulatory risk | Beta adjustment | [-0.2, -0.1, 0.0, +0.1, +0.2] |
+| Disruption risk | Terminal growth modifier | [-1.0%, -0.5%, 0.0%, +0.5%] |
+| Moat width | Competitive adv. period | [3, 5, 7, 10] years |
+| Management quality | Execution growth factor | [-2.0%, -1.0%, 0.0%, +1.0%, +2.0%] |
+| Financial health | Credit spread | Fixed synthetic rating mapping (70-800 bps) |
+| ROIC vs WACC gap | Value creation confidence | Bounds terminal perpetuity assumption |
 
-### Company Agent
-- **Management quality assessment** → Execution premium/discount on growth
-- **Moat width (narrow/wide/none)** → Duration of competitive advantage period
-- **Financial health analysis** → Probability of distress, cost of debt
+Buckets are derived from corporate valuation literature (Damodaran, McKinsey, CFA
+curriculum). Agents must justify their category choice in the narrative output.
 
-All qualitative judgments are bounded by industry ranges and must be justified in the final report.
+### Double-Counting Prevention (Critical Guardrail)
+
+The Company Agent is **explicitly restricted to idiosyncratic risks only** (customer
+concentration, key person risk, litigation, product obsolescence). It is forbidden
+from penalizing or adding premiums for systemic macro/country-level problems
+(e.g., general inflation, country risk). Those risks belong exclusively to Agents 1
+(Country) and 2 (Industry). This prevents the same underlying macroeconomic risk
+from being double-counted, which would over-discount cash flows and produce an
+unjustifiably low intrinsic value.
 
 ---
 
@@ -598,6 +633,25 @@ These are intentional deviations from the original Plan.txt, documented for tran
 ### 7. Shares Outstanding in Raw Count
 **Plan:** Shares outstanding in millions.
 **Actual:** yfinance returns actual share count (e.g., 14,687,356,000 for AAPL). The DCF model divides equity value by this raw count. Math is consistent as long as market cap and shares use the same units.
+
+### 8. Plan Refinements — Mathematical & Architectural Hardening (2026-07-02)
+**Plan (original):** Several sections had mathematical vulnerabilities, operational gaps, and LLM guardrail weaknesses.
+**Actual (refined Plan.txt):** Eight targeted fixes applied:
+
+*Mathematical:*
+- Growth decay formula replaced with continuous 3-knot spline (Company→Industry→Terminal) eliminating the year 3→4 discontinuity while preserving industry anchoring
+- Statutory tax rate adopted throughout Hamada's formula and WACC cost of debt to prevent anomalous tax-year distortions
+- Book value of debt explicitly documented as a proxy (`Total_Debt_Proxy`), with honest acknowledgment that true market values for corporate debt are unobservable
+
+*Operational robustness:*
+- FMP/Alpha Vantage designated as automatic fallback when yfinance peer data returns NaN
+- Diluted shares designated as the standard, with SEC EDGAR as primary validation source (applied at 3 locations: data sources, capital structure weights, and PV calculation)
+
+*LLM guardrails:*
+- Qualitative→quantitative conversion rebuilt with discrete categorical buckets instead of continuous ranges — eliminates hallucinated precision (e.g., CRP can only be 0|250|500|750|1000|1500 bps)
+- Company Agent restricted to idiosyncratic risks only, with explicit guardrail forbidding systemic macro/country penalization to prevent double-counting
+
+These refinements do not change the implemented code architecture — they tighten the plan's theoretical rigor and provide clearer guidance for future code-level hardening.
 
 ---
 
@@ -670,6 +724,9 @@ CI pipeline at `.github/workflows/ci.yml` runs on every push and pull request to
 ---
 
 ## Recent Fixes & Updates
+
+### Plan Refinements — Mathematical & Architectural Hardening (2026-07-02)
+Eight targeted fixes applied to Plan.txt addressing vulnerabilities identified in a systematic review. See Implementation Deviation #8 for full details. Key changes: continuous 3-knot growth decay spline, statutory tax rate in Hamada/WACC, discrete categorical buckets replacing continuous LLM ranges, double-counting prevention guardrail in Company Agent, FMP/Alpha Vantage fallback for peer NaN data, diluted shares via SEC EDGAR validation.
 
 ### PDF Narrative Truncation Fix (2026-06-25)
 **Problem:** Agent narrative text (macro, industry, company) was hard-truncated at 800 characters with `text[:800]`, cutting off mid-sentence on the company analysis PDF page.
