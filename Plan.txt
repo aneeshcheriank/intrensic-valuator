@@ -442,6 +442,50 @@ DCF is sensitive to assumptions. We cross-validate with relative valuation:
 
   Final Fair Value Range: [10th percentile, 90th percentile]
 
+5.8 Assumption Validation Layer (Pre-DCF Guardrail)
+--------------------------------------------------------------------------------
+Before assumptions from the AI agents enter the DCF engine, they pass through
+a deterministic validation layer. This prevents unrealistic or unsupported
+inputs from producing misleading valuations.
+
+  For each assumption (revenue growth, FCF margin, WACC components, terminal
+  growth rate), the validation layer checks:
+
+  A) Historical Range Check:
+     Compare the generated assumption against the company's own 5-year
+     historical range. If the generated value falls outside [Min_Historical,
+     Max_Historical], flag a warning with magnitude of deviation.
+
+  B) Industry Benchmark Check:
+     Compare against industry median and interquartile range. A growth
+     assumption 2× the industry median requires strong justification.
+
+  C) Statistical Confidence:
+     Assign a confidence band to each assumption:
+       - GREEN:  Within 1σ of historical mean — no flag
+       - AMBER:  1-2σ from historical mean — documented but accepted
+       - RED:    >2σ from historical mean — requires explicit override flag
+                 and is capped at 2σ unless the agent provides specific,
+                 verifiable evidence (new product launch, market entry)
+
+  D) Override Flag:
+     If an assumption exceeds bounds, it is NOT silently rejected. Instead:
+       1. The assumption is capped at the boundary value
+       2. An override flag is raised with the original value and the cap
+       3. The flag appears in the PDF report as a transparency note
+       4. Confidence score is penalized proportionally
+
+  Example:
+    Company 5-year revenue growth range: 3% – 9%
+    Agent-generated growth assumption: 17%
+    → RED flag: capped at 9% (2σ upper bound)
+    → Report note: "Revenue growth assumption capped at 9%. Agent initially
+       suggested 17% based on [cited evidence]. Growth rate capped to 2σ
+       historical ceiling. Valuation uses 9%."
+
+  This layer ensures the DCF engine never sees unvalidated inputs, regardless
+  of what the LLM agents produce.
+
 ================================================================================
 6. AGENTIC AI WORKFLOW (LangGraph Implementation)
 ================================================================================
@@ -569,14 +613,17 @@ LLM call with specific tools and a structured output schema.
   AGENT 4: Valuation Engine (Pure Python — no LLM)
   Inputs: All structured outputs from above + yfinance financial data
   Computation:
-    1. Pull FCF from cash flow statement
-    2. Project FCF for 5 years using growth rates from agents
-    3. Calculate WACC using CRP, beta, size premium
-    4. Calculate terminal value
-    5. Discount to present value
-    6. Calculate relative valuation comparables
-    7. Run Monte Carlo simulation (if enabled)
-    8. Blend DCF and relative valuation (70/30)
+    1. Validate all agent assumptions through Assumption Validation Layer
+       (Section 5.8) — historical range, industry benchmark, statistical
+       confidence checks with GREEN/AMBER/RED flagging
+    2. Pull FCF from cash flow statement
+    3. Project FCF for 5 years using validated growth rates from agents
+    4. Calculate WACC using CRP, beta, size premium
+    5. Calculate terminal value
+    6. Discount to present value
+    7. Calculate relative valuation comparables
+    8. Run Monte Carlo simulation (if enabled)
+    9. Blend DCF and relative valuation (70/30)
   Outputs:
     - intrinsic_value_per_share: float
     - fair_value_low: float (10th percentile)
@@ -596,15 +643,24 @@ LLM call with specific tools and a structured output schema.
       b. Agreement between DCF and relative valuation
       c. Data availability and quality
       d. Stability of historical financials
-    - Consider qualitative factors that might override: pending catalysts
-      (FDA approval, contract wins), technical factors (extreme momentum)
-    - Generate clear, actionable recommendation
+      e. Earnings estimate dispersion among analysts
+      f. Macroeconomic uncertainty indicators
+    - Assess qualitative risk factors that DO NOT override the valuation
+      but DO affect the risk narrative and position sizing guidance:
+      pending catalysts (FDA approval, contract wins), binary event risks,
+      extreme technical factors
+    - CRITICAL GUARDRAIL: The intrinsic valuation is NEVER overridden by
+      qualitative factors. Qualitative observations affect risk communication,
+      confidence scoring, and position sizing guidance only. The valuation
+      stands on its own — the narrative explains the risks around it.
+    - Generate clear, actionable recommendation with risk-aware narrative
   Outputs:
     - recommendation: Literal["BUY", "SELL", "HOLD"]
     - margin_of_safety: float (percentage)
     - confidence_score: float (0-100)
     - key_drivers: list[str] (3-5 bullet points)
     - key_risks: list[str] (3-5 bullet points)
+    - position_sizing_note: str (risk-aware guidance, if applicable)
     - executive_summary: str
 
 6.4 How Qualitative Becomes Quantitative (The Core Innovation)
@@ -629,9 +685,27 @@ mapped back to fixed quantitative variables.
   ROIC vs WACC gap                →  Value creation confidence  Bounds Terminal Perpetuity
   ═══════════════════════════════════════════════════════════════════════
 
-  Each conversion uses CALIBRATED BUCKETS — agents choose the structural category 
-  and justify their placement within the narrative output. The intervals are 
+  Each conversion uses CALIBRATED BUCKETS — agents choose the structural category
+  and justify their placement within the narrative output. The intervals are
   derived from corporate valuation literature (Damodaran, McKinsey, CFA curriculum).
+
+  EVIDENCE-CHAIN REQUIREMENT: Every numerical adjustment must cite specific
+  evidence. The agent cannot simply output "Management Quality: High → +2%
+  Growth" — it must document the evidence chain:
+
+    Example:
+      Management Score: High
+      Evidence:
+      • Five-year ROIC averaging 28% vs industry 14% — consistent value creation
+      • Conservative leverage (D/E 0.3) with disciplined buyback timing
+      • Three successful $1B+ acquisitions integrated in past 5 years
+      • CEO 12-year tenure with 18% annualized TSR during tenure
+      → Growth Adjustment: +2.0% (top bucket, justified by sustained execution)
+      → Confidence: High (multi-cycle track record, not single-year outperformance)
+
+  This makes every assumption auditable and rebuildable — a human analyst
+  should be able to read the evidence and either agree or disagree with the
+  bucket selection. The adjustment is traceable through the entire pipeline.
 
 ================================================================================
 7. RECOMMENDATION LOGIC
@@ -651,33 +725,64 @@ mapped back to fixed quantitative variables.
     - Transaction costs and taxes favor holding
     - Warren Buffett's principle: require a margin of safety on buys
 
+  NO-OVERRIDE PRINCIPLE: The intrinsic valuation is never overridden by
+  qualitative judgment. Binary event risks (FDA approval, contract outcomes,
+  regulatory decisions) do not change the fair value estimate — they change
+  the confidence level and the risk narrative communicated alongside it.
+  If a stock has a pending binary catalyst, the recommendation stands but
+  carries a position sizing warning and reduced confidence. This ensures
+  the valuation remains objective and auditable, while the risk communication
+  remains honest.
+
 7.2 Confidence Scoring
 --------------------------------------------------------------------------------
   Confidence_Score (0-100) = Weighted average of:
 
-  A) Forecast Precision (40% weight):
+  A) Forecast Precision (25% weight):
      Score = max(0, 100 − (Monte_Carlo_StdDev / Intrinsic_Value × 100))
      Narrower distribution → higher confidence
 
-  B) Model Agreement (30% weight):
+  B) Model Agreement (20% weight):
      Deviation = |DCF_Value − Relative_Value| / DCF_Value
      Score = max(0, 100 − Deviation × 200)
      Both models agreeing → higher confidence
 
-  C) Data Quality (20% weight):
+  C) Data Quality (15% weight):
      Checks: Are financials available for 5+ years? Is FCF positive?
      Are peer comparisons available (5+ peers)?
      Score: 0-100 based on data completeness
 
-  D) Stability (10% weight):
+  D) Historical Stability (10% weight):
      How consistent are historical margins and growth rates?
      Score: 100 − (Coefficient_of_Variation × 100), bounded 0-100
+
+  E) Analyst Consensus Agreement (10% weight):
+     How closely do the AI-generated growth/margin assumptions align with
+     analyst consensus estimates (from FMP)?
+     Score: 100 − (|AI_Estimate − Consensus_Estimate| / Consensus_Estimate × 100)
+     High dispersion among analysts also penalizes this score.
+
+  F) Macroeconomic Uncertainty (10% weight):
+     Measures current macro environment predictability:
+       - VIX level (equity market uncertainty)
+       - Fed funds rate trajectory uncertainty (rate change frequency)
+       - GDP forecast dispersion among economists
+     Low uncertainty → higher confidence.
+
+  G) Assumption Validation Score (10% weight):
+     How many agent assumptions passed the Validation Layer without flags?
+       - All GREEN:  100
+       - Some AMBER: 70
+       - Any RED:    40
+       - Multiple RED: 20
+     This directly links confidence to input quality.
 
   Confidence Interpretation:
     >80: High confidence — recommendation is robust
     50-80: Moderate confidence — use position sizing
-    30-50: Low confidence — wide range of outcomes
-    <30: Very low confidence — speculative, not actionable
+    30-50: Low confidence — wide range of outcomes; reduced position size
+    <30: Very low confidence — speculative, not actionable without
+         independent verification
 
 ================================================================================
 8. PDF REPORT GENERATION
@@ -748,6 +853,29 @@ The PDF report is the deliverable. It must be:
       • Moat width: Wide (ecosystem lock-in, brand, switching costs)
       • ROIC: 42% vs WACC 9.2% = strong value creation
       • Key risk: China exposure (~19% of revenue)
+
+      Growth Attribution (Feature Breakdown):
+      To show WHY the 6.5% growth assumption was chosen, each driver is
+      decomposed with its individual contribution:
+      ┌──────────────────────────────┬───────────────┐
+      │ Growth Driver                │ Contribution  │
+      ├──────────────────────────────┼───────────────┤
+      │ Historical Revenue CAGR      │ +3.2%         │
+      │ Industry Tailwind            │ +1.5%         │
+      │ Services Mix-Shift           │ +1.2%         │
+      │ Geographic Expansion         │ +0.8%         │
+      │ Management Execution Premium │ +0.5%         │
+      │ Emerging Market Exposure     │ +0.3%         │
+      │ Regulatory Headwinds         │ -0.4%         │
+      │ Competitive Pressure         │ -0.6%         │
+      ├──────────────────────────────┼───────────────┤
+      │ NET GROWTH ASSUMPTION        │ 6.5%          │
+      └──────────────────────────────┴───────────────┘
+
+      This attribution table makes the growth assumption auditable — every
+      component driver is traceable to specific agent findings with cited
+      evidence. A human analyst can agree or disagree with individual
+      contributions rather than accepting or rejecting the final number.
 
   SECTION 4: VALUATION SUMMARY TABLE
   ┌────────────────────────────────────────────┐
@@ -1084,7 +1212,16 @@ Tasks:
      - Results dashboard: recommendation badge, key metrics, narratives
      - "Download PDF Report" button with browser download
      - PDF filename: {TICKER}_Valuation_Report_{YYYY-MM-DD}.pdf
-  4. 📋 Backtesting framework (future enhancement)
+  4. 📋 Backtesting Framework — PROMOTED TO CORE (see Section 11.5)
+     - Track historical recommendations against actual 12-month price returns
+     - Measure component-level effectiveness:
+       • Does Country Analysis improve valuation accuracy?
+       • Does Industry Analysis improve peer selection?
+       • Does Management scoring improve forecast precision?
+       • Does Monte Carlo improve confidence calibration?
+       • Does Relative Valuation reduce DCF error?
+     - Calibrate discrete buckets against historical outcomes
+     - Generate backtest reports: hit rate, mean error, Sharpe of recommendations
   5. ✅ Error handling and edge cases
      - Graceful degradation when LLM unavailable (uses data defaults)
      - Missing data handling in yahoo_fetcher (returns 0.0 for missing fields)
@@ -1118,37 +1255,90 @@ Tasks:
     is caveated. SEC EDGAR serves as ground truth for US stocks.
 
   Risk 4: Model Drift Over Time
-    Mitigation: Regular backtesting against actual price movements. If
-    recommendation accuracy degrades, recalibrate agent prompts and ranges.
+    Mitigation: Backtesting is core infrastructure (not a future enhancement).
+    Every recommendation is tracked against actual 12-month price returns.
+    Component-level attribution identifies which layer (growth, margin, WACC,
+    terminal value) contributed most to forecast error. If recommendation
+    accuracy degrades, recalibrate agent prompts and bucket boundaries.
 
   Risk 5: Rate Limits on Free APIs
     Mitigation: Aggressive caching. Financial data TTLs are long (daily to
     monthly). Cache hit rate should be >90% for repeat valuations.
 
+  Risk 6: Unrealistic LLM-Generated Assumptions
+    Mitigation: The Assumption Validation Layer (Section 5.8) caps all
+    agent-generated assumptions at 2σ historical bounds. Any assumption
+    exceeding historical ranges is flagged, capped, and reported in the
+    PDF with transparency notes. Confidence score is penalized for RED flags.
+
 ================================================================================
 11. SUCCESS METRICS
 ================================================================================
 
-  - DCF model matches within ±10% of manual Excel DCF for same inputs
-  - Agent-generated WACC components (CRP, beta) within ±20% of professional
-    data sources (Damodaran, KPMG, Kroll)
-  - End-to-end pipeline produces recommendation in <30 seconds
-  - Backtest: BUY recommendations outperform market by 5%+ over 12 months
-  - Recommendations match professional analyst consensus direction >60% of time
-    (disagreement is okay — the AI should find opportunities analysts miss)
+  Operational Metrics:
+    - DCF model matches within ±10% of manual Excel DCF for same inputs
+    - Agent-generated WACC components (CRP, beta) within ±20% of professional
+      data sources (Damodaran, KPMG, Kroll)
+    - End-to-end pipeline produces recommendation in <30 seconds
+
+  Backtesting-Driven Metrics (Core Infrastructure):
+    - BUY recommendations outperform market by 5%+ over 12 months
+    - Recommendations match professional analyst consensus direction >60% of time
+      (disagreement is okay — the AI should find opportunities analysts miss)
+
+  Component-Level Validation (Measurable per-component effectiveness):
+    - Country Analysis: Does including CRP improve valuation accuracy vs.
+      using a flat 5% ERP? (A/B test on historical basket)
+    - Industry Analysis: Does industry-specific beta produce better forecasts
+      than using a flat β=1.0?
+    - Company Analysis: Does the management quality score correlate with
+      subsequent earnings surprises?
+    - Monte Carlo: Is the 10th-90th percentile range well-calibrated?
+      (actual price should fall within the range ~80% of the time)
+    - Relative Valuation: Does blending DCF with relative valuation (70/30)
+      outperform pure DCF or pure relative valuation?
+    - Discrete Buckets: Do the chosen bucket boundaries (e.g., CRP at
+      0|250|500|750|1000|1500 bps) segment actual country returns correctly?
+
+  Without these measurements, it is impossible to determine whether any
+  component of the system actually creates value beyond a simple DCF with
+  default assumptions. Backtesting is the only mechanism for validating
+  that the top-down architecture, multi-agent design, and qualitative-to-
+  quantitative conversion collectively produce better results than a
+  naive spreadsheet model.
 
 ================================================================================
 12. FUTURE ENHANCEMENTS (v2+)
 ================================================================================
 
-  - Real-time news ingestion affecting conviction scores
-  - Earnings call transcript analysis (NLP on management tone)
-  - Insider trading monitoring
-  - ESG risk integration
-  - Multi-currency support and FX-adjusted returns
-  - Portfolio-level optimization (not just individual stock picks)
-  - Custom user risk profiles (aggressive/moderate/conservative)
-  - Integration with brokerage APIs for automated trading signals
+  v2 ARCHITECTURAL EVOLUTION:
+    - Evidence Extraction Pipeline: Shift LLM role from number generation to
+      evidence extraction. LLMs extract structured qualitative evidence from
+      filings, transcripts, and news; a deterministic scoring engine converts
+      evidence into valuation assumptions. This is the single most impactful
+      architectural improvement — it makes the system auditable, calibratable,
+      and resistant to LLM drift across model versions.
+    - Calibrated Models: Replace fixed discrete buckets with historically-
+      calibrated mappings. Use backtesting infrastructure to learn, e.g.,
+      what "Wide Moat" actually implies for ROIC persistence and competitive
+      advantage period, based on observed outcomes rather than prompts.
+    - Automated Prompt Calibration: Run prompts against historical data
+      where outcomes are known; adjust prompt wording and bucket boundaries
+      to minimize forecast error. Treat prompts like model hyperparameters
+      that can be optimized.
+    - Live Backtesting Dashboard: Continuous tracking of all recommendations
+      against actual price returns, with component-level attribution of
+      forecast error (was the error in growth, margin, WACC, or terminal value?)
+
+  ENHANCEMENTS (v2+):
+    - Real-time news ingestion affecting conviction scores
+    - Earnings call transcript analysis (NLP on management tone)
+    - Insider trading monitoring
+    - ESG risk integration
+    - Multi-currency support and FX-adjusted returns
+    - Portfolio-level optimization (not just individual stock picks)
+    - Custom user risk profiles (aggressive/moderate/conservative)
+    - Integration with brokerage APIs for automated trading signals
 
 ================================================================================
 13. IMPLEMENTATION DEVIATIONS

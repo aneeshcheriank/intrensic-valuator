@@ -285,6 +285,22 @@ pre-calculated multiples.
 - **Bear Case**: Lower growth, higher WACC
 - Monte Carlo: 10,000 simulations varying growth and discount rate
 
+### Assumption Validation Layer (Pre-DCF Guardrail)
+Before agent-generated assumptions enter the DCF engine, they pass through validation:
+- **Historical Range Check**: Assumptions outside the company's 5-year historical range are flagged
+- **Industry Benchmark**: Assumptions >2× industry median require strong justification
+- **Statistical Confidence Bands**: GREEN (within 1σ), AMBER (1-2σ), RED (>2σ — capped)
+- **Override Flags**: RED assumptions are capped at 2σ and reported transparently in the PDF
+- Confidence score is penalized for each flag raised
+
+### Evidence-Chain Requirement
+Every numerical adjustment must cite specific evidence. Agents cannot output
+"Management: High → +2% Growth" without documenting the evidence chain:
+- Specific metrics (ROIC, D/E, acquisition track record, CEO tenure/TSR)
+- Why this evidence supports the chosen bucket
+- Confidence level in the evidence
+This makes every assumption auditable and rebuildable by a human analyst.
+
 ---
 
 ## Recommendation Engine
@@ -296,8 +312,16 @@ If Intrinsic_Value > Current_Price × 1.20 → BUY
 If Intrinsic_Value < Current_Price × 0.90 → SELL
 Else → HOLD
 
-Confidence_Score = f(forecast_uncertainty, data_quality, model_agreement)
+Confidence_Score = f(forecast_precision, model_agreement, data_quality,
+                     historical_stability, analyst_consensus, macro_uncertainty,
+                     assumption_validation)
 ```
+
+**No-Override Principle:** The intrinsic valuation is never overridden by
+qualitative judgment. Binary event risks (FDA approval, contract outcomes)
+affect confidence and risk narrative — not the fair value estimate. The
+Recommendation Agent communicates risks alongside the valuation; it does not
+change the valuation itself. This keeps the system objective and auditable.
 
 ---
 
@@ -308,7 +332,7 @@ The system generates a professional PDF report downloadable from the UI. The rep
 ### Report Sections
 1. **Cover Page** — Company name, ticker, date, recommendation badge (color-coded: Green BUY / Red SELL / Amber HOLD)
 2. **Executive Summary** (Page 1) — 3-4 paragraph synthesis: what the company does, key valuation drivers, recommendation with confidence score, one-line summary from each analysis layer
-3. **Key Findings** — Bullet-point findings from Country, Industry, and Company agents
+3. **Key Findings** — Bullet-point findings from Country, Industry, and Company agents, plus a **Growth Attribution Table** decomposing the revenue growth assumption into component drivers (historical CAGR, industry tailwind, product expansion, management execution, regulatory headwinds, etc.) with individual contributions summing to the net assumption
 4. **Valuation Summary** — Table showing: Current Price, Intrinsic Value, Margin of Safety, Fair Value Range, WACC, Terminal Growth Rate, Terminal Value % of EV
 5. **DCF Projection Table** — Year-by-year FCF, discount factor, present value
 6. **Scenario Analysis** — Bull / Base / Bear case table with intrinsic values
@@ -449,7 +473,13 @@ intrensic-valuator/
    - **HTTP cache** (`get_http_session`): `requests-cache` CachedSession with per-URL-pattern TTLs. Transparently caches raw HTTP responses from all data-source REST APIs. `stale_if_error=True` serves stale cache if the remote is unreachable.
    - TTLs: Prices=1d, Financials=7d, Rates=7d, GDP=30d, Estimates=7d.
 
-6. **Confidence scoring** — Not just a recommendation but how confident the model is. Based on: forecast range width (Monte Carlo std dev), data availability score, and model agreement between DCF and relative valuation.
+6. **Confidence scoring** — 7-factor weighted model: forecast precision (25%), model agreement (20%), data quality (15%), historical stability (10%), analyst consensus agreement (10%), macroeconomic uncertainty (10%), and assumption validation (10%). Confidence is an assessment of model reliability, not just valuation uncertainty.
+
+7. **No-override principle** — The intrinsic valuation is never overridden by qualitative judgment. Binary events affect confidence and risk narrative, not fair value. Keeps the system objective and auditable.
+
+8. **Assumption validation layer** — All agent-generated assumptions pass through historical range, industry benchmark, and statistical confidence checks before entering the DCF. RED-flagged assumptions are capped at 2σ and reported transparently.
+
+9. **Backtesting as core infrastructure** — Every recommendation is tracked against actual returns. Component-level attribution identifies which layer contributed most to forecast error. Without this, it's impossible to know if the multi-agent architecture adds value beyond a naive DCF.
 
 7. **PDF Report Generation** — Professional, downloadable PDF report with executive summary, key findings, valuation tables, scenario analysis, and charts. Built with `reportlab` (pure Python) + `matplotlib` for embedded charts. Served as a download button in the Streamlit UI.
 
@@ -485,10 +515,11 @@ intrensic-valuator/
 - ✅ Integrate agent outputs → DCF inputs → valuation (defaults used when no LLM)
 
 ### Phase 4: Recommendation & Polish
-- ✅ Recommendation engine with confidence scoring
-- ✅ PDF report generation (10 sections: cover, exec summary, key findings, valuation, DCF projection, scenarios, Monte Carlo, peer comparison, risks, disclaimer)
+- ✅ Recommendation engine with confidence scoring (7-factor model)
+- ✅ No-override principle: valuation stands; qualitative factors affect confidence and risk narrative only
+- ✅ PDF report generation (10 sections: cover, exec summary, key findings + growth attribution, valuation, DCF projection, scenarios, Monte Carlo, peer comparison, risks, disclaimer)
 - ✅ Streamlit UI with ticker input, report display, and PDF download button
-- 📋 Backtesting against historical recommendations (future enhancement)
+- 📋 Backtesting framework — **promoted to core infrastructure** (track historical recommendations, component-level validation: does Country Analysis improve accuracy? Does Monte Carlo calibrate correctly? Does blending beat pure DCF?)
 - ✅ Tests and documentation
 
 ---
@@ -653,6 +684,23 @@ These are intentional deviations from the original Plan.txt, documented for tran
 
 These refinements do not change the implemented code architecture — they tighten the plan's theoretical rigor and provide clearer guidance for future code-level hardening.
 
+### 9. Recommendations-Driven Architectural Hardening (2026-07-02)
+Following a systematic review of the plan, six additional architectural principles were adopted:
+
+*No-override principle:* The intrinsic valuation is never overridden by qualitative judgment. Binary events (FDA, contracts) affect confidence and risk narrative only.
+
+*Assumption validation layer:* All agent assumptions are checked against historical ranges, industry benchmarks, and statistical confidence bands (GREEN/AMBER/RED) before entering the DCF engine. RED assumptions are capped at 2σ and reported transparently.
+
+*Evidence-chain requirement:* Every numerical adjustment must cite specific, verifiable evidence. "Management: High → +2% Growth" is not sufficient — the agent must document ROIC track record, leverage history, acquisition integration, and why this evidence supports the chosen bucket.
+
+*Feature attribution:* Growth assumptions are decomposed into component drivers (historical CAGR, industry tailwind, product expansion, management execution, regulatory headwinds) with individual contributions summing to the net assumption.
+
+*Expanded confidence scoring:* Model grew from 4 to 7 factors, adding analyst consensus agreement, macroeconomic uncertainty, and assumption validation quality.
+
+*Backtesting promoted to core:* Backtesting moved from "future enhancement" to core infrastructure with component-level validation (does Country Analysis improve accuracy? Is Monte Carlo well-calibrated? Does blending beat pure DCF?).
+
+These principles represent the v1 architectural guardrails. The v2 roadmap extends further: shift LLMs from number generation to evidence extraction, replace fixed discrete buckets with historically-calibrated models, and automate prompt calibration against known outcomes.
+
 ---
 
 ## Testing
@@ -727,6 +775,9 @@ CI pipeline at `.github/workflows/ci.yml` runs on every push and pull request to
 
 ### Plan Refinements — Mathematical & Architectural Hardening (2026-07-02)
 Eight targeted fixes applied to Plan.txt addressing vulnerabilities identified in a systematic review. See Implementation Deviation #8 for full details. Key changes: continuous 3-knot growth decay spline, statutory tax rate in Hamada/WACC, discrete categorical buckets replacing continuous LLM ranges, double-counting prevention guardrail in Company Agent, FMP/Alpha Vantage fallback for peer NaN data, diluted shares via SEC EDGAR validation.
+
+### Recommendations-Driven Architectural Principles (2026-07-02)
+Six architectural principles adopted from external review: no-override principle, assumption validation layer (GREEN/AMBER/RED with 2σ capping), evidence-chain requirement for all adjustments, feature attribution in growth decomposition, expanded 7-factor confidence scoring, and backtesting promoted from future enhancement to core infrastructure. See Implementation Deviation #9 for full details.
 
 ### PDF Narrative Truncation Fix (2026-06-25)
 **Problem:** Agent narrative text (macro, industry, company) was hard-truncated at 800 characters with `text[:800]`, cutting off mid-sentence on the company analysis PDF page.
