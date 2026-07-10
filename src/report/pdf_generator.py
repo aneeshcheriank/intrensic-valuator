@@ -114,20 +114,31 @@ def _safe_text(text: str, max_chars: int = 4000) -> str:
     - Limits to *max_chars* at a paragraph boundary (not mid-sentence)
     - Preserves double-newlines as paragraph breaks via ``<br/>`` tags
     """
+    import re
+
     if not text:
         return ""
 
-    # Strip actual HTML/XML tags (but keep our <br/> and <b> tags)
-    import re
     # Remove anything that looks like an unclosed or problematic XML tag
+    # (keep our intentional <b>, </b>, <br/>, <br /> tags)
     text = re.sub(r"<(?!b>|/b>|br/>|br />)[^>]+>", "", text)
 
-    # Escape XML special characters that aren't our tags
-    text = text.replace("&", "&amp;")
-    # Restore our intentional entities
-    text = text.replace("&amp;lt;b&amp;gt;", "<b>")
-    text = text.replace("&amp;lt;/b&amp;gt;", "</b>")
-    text = text.replace("&amp;lt;br/&amp;gt;", "<br/>")
+    # Escape bare ampersands that aren't already part of HTML entities
+    # Pattern: & not followed by word chars + semicolon (e.g., &amp;, &lt;)
+    text = re.sub(r"&(?!\w+;)", "&amp;", text)
+
+    # Escape stray < and > that aren't our intentional tags
+    # (text after tag-stripping should have none, but be safe)
+    # We do this by protecting intentional tags, escaping, then restoring
+    text = text.replace("<b>", "\x00B\x00")
+    text = text.replace("</b>", "\x00/B\x00")
+    text = text.replace("<br/>", "\x00BR/\x00")
+    text = text.replace("<br />", "\x00BR \x00")
+    text = text.replace("<", "&lt;").replace(">", "&gt;")
+    text = text.replace("\x00B\x00", "<b>")
+    text = text.replace("\x00/B\x00", "</b>")
+    text = text.replace("\x00BR/\x00", "<br/>")
+    text = text.replace("\x00BR \x00", "<br />")
 
     if len(text) <= max_chars:
         return text
@@ -341,6 +352,37 @@ class PDFReportGenerator:
         if self.state.get("company_narrative"):
             self.story.append(_p(_safe_text(self.state["company_narrative"]), s["body_small"]))
 
+        # --- Growth Attribution Table ---
+        growth_attr = self.state.get("growth_attribution", {})
+        if growth_attr:
+            self.story.append(Spacer(1, 0.15 * inch))
+            self.story.append(_p("Growth Attribution", s["subsection_header"]))
+            self.story.append(_p(
+                "The revenue growth forecast is decomposed into component drivers below. "
+                "Each driver's contribution reflects the analyst's assessment of its "
+                "impact on the company's 5-year CAGR.",
+                s["body_small"]
+            ))
+            attr_rows = [
+                ["Historical CAGR", _fmt(growth_attr.get("historical_cagr", 0), as_pct=True)],
+                ["Industry Tailwind/Headwind", _fmt(growth_attr.get("industry_tailwind", 0), as_pct=True)],
+                ["Product/Service Expansion", _fmt(growth_attr.get("product_expansion", 0), as_pct=True)],
+                ["Geographic Expansion", _fmt(growth_attr.get("geographic_expansion", 0), as_pct=True)],
+                ["Management Execution", _fmt(growth_attr.get("management_execution", 0), as_pct=True)],
+                ["Regulatory Impact", _fmt(growth_attr.get("regulatory_impact", 0), as_pct=True)],
+                ["Net Forecast", _fmt(growth_attr.get("net_forecast", 0), as_pct=True)],
+            ]
+            self.story.append(_make_table(["Driver", "Contribution"], attr_rows, [3.0 * inch, 2.0 * inch]))
+
+        # --- Evidence Chain Summary ---
+        evidence = self.state.get("company_evidence_chain", {})
+        if evidence:
+            self.story.append(Spacer(1, 0.15 * inch))
+            self.story.append(_p("Evidence Chain (Company Adjustments)", s["subsection_header"]))
+            for param, ev_text in evidence.items():
+                if ev_text:
+                    self.story.append(_p(f"<b>{param}:</b> {str(ev_text)[:300]}", s["body_small"]))
+
         self.story.append(PageBreak())
 
     def _valuation_summary(self) -> None:
@@ -365,7 +407,45 @@ class PDFReportGenerator:
             ["Recommendation", self.state.get("recommendation", "HOLD")],
             ["Confidence Score", f"{self.state.get('confidence_score', 50)} / 100"],
         ]
+
+        # Add confidence breakdown if available
+        conf_breakdown = self.state.get("confidence_breakdown", {})
+        if conf_breakdown:
+            rows.append(["", ""])  # spacer
+            rows.append(["Confidence Breakdown", ""])
+            rows.append(["  Forecast Precision (25%)", f"{conf_breakdown.get('forecast_precision', 0):.1f} / 25"])
+            rows.append(["  Model Agreement (20%)", f"{conf_breakdown.get('model_agreement', 0):.1f} / 20"])
+            rows.append(["  Data Quality (15%)", f"{conf_breakdown.get('data_quality', 0):.1f} / 15"])
+            rows.append(["  Historical Stability (10%)", f"{conf_breakdown.get('historical_stability', 0):.1f} / 10"])
+            rows.append(["  Analyst Consensus (10%)", f"{conf_breakdown.get('analyst_consensus', 0):.1f} / 10"])
+            rows.append(["  Macro Uncertainty (10%)", f"{conf_breakdown.get('macro_uncertainty', 0):.1f} / 10"])
+            rows.append(["  Assumption Validation (10%)", f"{conf_breakdown.get('assumption_validation', 0):.1f} / 10"])
+
         self.story.append(_make_table(["Metric", "Value"], rows, [3.0 * inch, 2.5 * inch]))
+
+        # --- Assumption Validation Flags ---
+        val_flags = self.state.get("validation_flags", [])
+        if val_flags:
+            self.story.append(Spacer(1, 0.15 * inch))
+            self.story.append(_p("Assumption Validation (Pre-DCF Guardrail)", s["subsection_header"]))
+            self.story.append(_p(
+                "The following assumptions were flagged during pre-DCF validation. "
+                "RED-flagged assumptions are capped at 2σ from historical mean and "
+                "reported transparently below.",
+                s["body_small"]
+            ))
+            for flag in val_flags:
+                band_color = {"RED": "#B71C1C", "AMBER": "#E65100", "GREEN": "#1B5E20"}
+                color = band_color.get(flag.get("band", "GREEN"), "#212121")
+                self.story.append(_p(
+                    f"<font color='{color}'><b>[{flag.get('band', '?')}]</b></font> "
+                    f"<b>{flag.get('parameter', '')}:</b> "
+                    f"Agent value = {_fmt(flag.get('agent_value', 0), as_pct=True)}, "
+                    f"Capped = {_fmt(flag.get('capped_value', 0), as_pct=True)}",
+                    s["body"]
+                ))
+                self.story.append(_p(f"<i>{flag.get('message', '')}</i>", s["body_small"]))
+
         self.story.append(PageBreak())
 
     def _dcf_projection(self) -> None:
@@ -511,6 +591,20 @@ class PDFReportGenerator:
                 self.story.append(_p(f"{i}. {risk}", s["body"]))
         else:
             self.story.append(_p("No specific risk factors identified.", s["body"]))
+
+        # Binary risk flags
+        binary_flags = self.state.get("binary_risk_flags", [])
+        if binary_flags:
+            self.story.append(Spacer(1, 0.15 * inch))
+            self.story.append(_p("Binary Event Risks", s["subsection_header"]))
+            self.story.append(_p(
+                "The following binary event risks were identified. Per the no-override "
+                "principle, these affect confidence and position sizing — not the "
+                "intrinsic valuation.",
+                s["body_small"]
+            ))
+            for flag in binary_flags:
+                self.story.append(_p(f"• ⚠️ {flag}", s["body"]))
 
         # Also show drivers
         drivers = self.state.get("key_drivers", [])

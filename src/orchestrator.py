@@ -1,11 +1,20 @@
 """
 LangGraph orchestrator for the top-down valuation agent pipeline.
 
-The graph executes: Country → Industry → Company → Valuation → Recommendation.
+The graph executes:
+    DataFetch → Country → Industry → Company
+              → AssumptionValidation → Valuation → Recommendation.
 
 Each agent node is an LLM call with structured output.  The Valuation
 node is pure Python computation (no LLM).  State flows between nodes
 automatically via LangGraph's state management.
+
+Key architectural guardrails (v1):
+  - Assumption Validation Layer: GREEN/AMBER/RED bands before DCF
+  - No-override principle: qualitative factors affect confidence, not fair value
+  - Evidence-chain requirement: every adjustment must cite verifiable evidence
+  - 7-factor confidence scoring: forecast precision, model agreement, data quality,
+    historical stability, analyst consensus, macro uncertainty, assumption validation
 """
 
 from __future__ import annotations
@@ -19,6 +28,8 @@ from langgraph.graph import END, StateGraph
 from src.data.data_cache import DataCache
 from src.data.macro_fetcher import MacroFetcher
 from src.data.yahoo_fetcher import YahooFinanceFetcher
+from src.valuation.assumption_validator import AssumptionValidator, ValidationReport
+from src.valuation.backtester import BacktestStore
 from src.valuation.dcf_model import DCFModel, decay_growth_rates
 from src.valuation.monte_carlo import MonteCarloSimulation, ScenarioAnalysis
 from src.valuation.relative_val import RelativeValuation
@@ -65,6 +76,7 @@ def initial_state(ticker: str) -> ValuationState:
         currency_risk_adj=0.0,
         risk_free_rate=0.04,
         macro_narrative="",
+        country_evidence_chain={},
         # --- Industry layer ---
         industry_growth_rate=0.05,
         industry_beta=1.0,
@@ -74,6 +86,7 @@ def initial_state(ticker: str) -> ValuationState:
         peer_tickers=[],
         industry_fcf_margin_avg=0.15,
         industry_narrative="",
+        industry_evidence_chain={},
         # --- Company layer ---
         revenue_growth_forecast=0.05,
         fcf_margin_forecast=0.15,
@@ -86,8 +99,14 @@ def initial_state(ticker: str) -> ValuationState:
         company_narrative="",
         key_company_drivers=[],
         key_company_risks=[],
+        company_evidence_chain={},
+        growth_attribution={},
         # --- Financial data ---
         financials={},
+        statutory_tax_rate=0.21,  # US statutory federal rate (default)
+        # --- Assumption Validation ---
+        validation_report={},
+        validation_flags=[],
         # --- Valuation ---
         wacc=0.10,
         intrinsic_value=0.0,
@@ -101,10 +120,12 @@ def initial_state(ticker: str) -> ValuationState:
         # --- Output ---
         recommendation="HOLD",
         confidence_score=50,
+        confidence_breakdown={},
         margin_of_safety=0.0,
         executive_summary="",
         key_drivers=[],
         key_risks=[],
+        binary_risk_flags=[],
         # --- Metadata ---
         status="pending",
         errors=[],
@@ -229,6 +250,10 @@ def _fetch_data_node(state: ValuationState) -> ValuationState:
         state["industry_beta"] = metrics.get("beta", 1.0)
         state["industry_growth_rate"] = metrics.get("revenue_growth", 0.04)
 
+        # Statutory tax rate — use the jurisdiction's statutory corporate rate
+        # (Damodaran convention: statutory rate in WACC, not effective rate)
+        state["statutory_tax_rate"] = _get_statutory_tax_rate(state["country"])
+
         # Macro snapshot for the identified country
         macro_snap = macro.fetch_macro_snapshot(state["country"])
         state["risk_free_rate"] = macro_snap.get("risk_free_rate", 0.04) / 100.0 if macro_snap.get("risk_free_rate", 0) > 1 else macro_snap.get("risk_free_rate", 0.04)
@@ -257,7 +282,6 @@ def _country_agent_node(state: ValuationState) -> ValuationState:
 
     logger.info("[Country Agent] Analyzing macro environment...")
 
-    # Build context for the agent
     context = f"""
 ## Company
 - Name: {state.get('company_name', 'Unknown')}
@@ -290,6 +314,11 @@ def _country_agent_node(state: ValuationState) -> ValuationState:
         state["political_stability_score"] = parsed.get("political_stability_score", 7.0)
         state["currency_risk_adj"] = parsed.get("currency_risk_adj", 0.0)
         state["macro_narrative"] = parsed.get("macro_narrative", "")
+        state["country_evidence_chain"] = parsed.get("evidence_chain", {})
+        if "key_strengths" in parsed:
+            state["key_company_drivers"] = parsed["key_strengths"]
+        if "key_risks" in parsed:
+            state["key_company_risks"] = parsed["key_risks"]
 
         logger.info(f"[Country Agent] CRP={state['country_risk_premium']*10000:.0f} bps | GDP={state['gdp_growth_forecast']*100:.1f}%")
         state["status"] = "country_analyzed"
@@ -354,6 +383,7 @@ def _industry_agent_node(state: ValuationState) -> ValuationState:
         state["disruption_risk_score"] = parsed.get("disruption_risk_score", 5.0)
         state["industry_fcf_margin_avg"] = parsed.get("industry_fcf_margin_avg", 0.15)
         state["industry_narrative"] = parsed.get("industry_narrative", "")
+        state["industry_evidence_chain"] = parsed.get("evidence_chain", {})
         if parsed.get("peer_tickers"):
             state["peer_tickers"] = parsed["peer_tickers"]
 
@@ -427,6 +457,8 @@ def _company_agent_node(state: ValuationState) -> ValuationState:
         state["company_narrative"] = parsed.get("company_narrative", "")
         state["key_company_drivers"] = parsed.get("key_drivers", [])
         state["key_company_risks"] = parsed.get("key_risks", [])
+        state["company_evidence_chain"] = parsed.get("evidence_chain", {})
+        state["growth_attribution"] = parsed.get("growth_attribution", {})
 
         logger.info(f"[Company Agent] Growth={state['revenue_growth_forecast']*100:.1f}% | Margin={state['fcf_margin_forecast']*100:.1f}% | Moat={state['moat_width_score']:.0f}/10")
         state["status"] = "company_analyzed"
@@ -435,6 +467,80 @@ def _company_agent_node(state: ValuationState) -> ValuationState:
         logger.error(f"[Company Agent] Failed: {exc}")
         state["errors"].append(f"Company agent error: {exc}")
 
+    return state
+
+
+def _assumption_validation_node(state: ValuationState) -> ValuationState:
+    """Pre-DCF guardrail: validate all agent assumptions before they enter valuation.
+
+    Runs the Assumption Validation Layer to check each assumption against
+    historical ranges, industry benchmarks, and statistical confidence bands.
+    RED-flagged assumptions are capped at 2σ.
+    """
+    logger.info("[Assumption Validation] Validating agent assumptions...")
+
+    fin = state.get("financials", {})
+
+    # Build historical data from financials if available
+    historical = {}
+    if fin.get("revenue_growth_history"):
+        historical["revenue_growth_historical"] = fin["revenue_growth_history"]
+    if fin.get("fcf_margin_history"):
+        historical["fcf_margin_historical"] = fin["fcf_margin_history"]
+
+    # Build industry benchmarks
+    industry_benchmarks = {
+        "revenue_growth": state.get("industry_growth_rate", 0.05),
+        "fcf_margin": state.get("industry_fcf_margin_avg", 0.15),
+        "industry_beta": 1.0,  # market beta as reference
+        "industry_growth_rate": state.get("gdp_growth_forecast", 0.025),  # long-run reference
+    }
+
+    validator = AssumptionValidator(
+        historical_financials=historical if historical else None,
+        industry_benchmarks=industry_benchmarks,
+    )
+
+    # Assumptions to validate
+    assumptions = {
+        "revenue_growth": state.get("revenue_growth_forecast", 0.05),
+        "fcf_margin": state.get("fcf_margin_forecast", 0.15),
+        "country_risk_premium": state.get("country_risk_premium", 0.0),
+        "industry_growth_rate": state.get("industry_growth_rate", 0.05),
+        "company_specific_risk_premium": state.get("company_specific_risk_premium", 0.0),
+    }
+
+    report: ValidationReport = validator.validate_all(assumptions)
+    state["validation_report"] = report.to_dict()
+
+    # Extract flags for display
+    flags = []
+    for result in report.results:
+        if result.band.value != "GREEN":
+            flags.append({
+                "parameter": result.parameter,
+                "band": result.band.value,
+                "agent_value": result.agent_value,
+                "capped_value": result.capped_value,
+                "message": result.message,
+            })
+    state["validation_flags"] = flags
+
+    # Cap RED assumptions — reuse report results (avoids re-running validation)
+    capped = {}
+    for result in report.results:
+        capped[result.parameter] = result.capped_value
+    state["revenue_growth_forecast"] = capped.get("revenue_growth", state["revenue_growth_forecast"])
+    state["fcf_margin_forecast"] = capped.get("fcf_margin", state["fcf_margin_forecast"])
+    state["country_risk_premium"] = capped.get("country_risk_premium", state["country_risk_premium"])
+    state["industry_growth_rate"] = capped.get("industry_growth_rate", state["industry_growth_rate"])
+    state["company_specific_risk_premium"] = capped.get("company_specific_risk_premium", state["company_specific_risk_premium"])
+
+    logger.info(
+        f"[Assumption Validation] {report.green_count}G / {report.amber_count}A / {report.red_count}R | "
+        f"Overall: {report.overall_band.value}"
+    )
+    state["status"] = "assumptions_validated"
     return state
 
 
@@ -453,12 +559,12 @@ def _valuation_node(state: ValuationState) -> ValuationState:
         # --- WACC Calculation ---
         wacc_calc = WACCCalculator()
 
-        # Relever beta to company's D/E
+        # Relever beta to company's D/E using STATUTORY tax rate
         from src.valuation.wacc_calculator import relever_beta
 
         equity_val = fin.get("market_cap", 0.0)
         debt_val = fin.get("total_debt", 0.0)
-        tax_rate = fin.get("tax_rate", 0.21)
+        tax_rate = state.get("statutory_tax_rate", 0.21)  # Statutory, not effective
         unlevered_beta = state.get("industry_beta", 1.0)
         levered_beta = relever_beta(unlevered_beta, debt_val, equity_val, tax_rate) if equity_val > 0 else unlevered_beta
 
@@ -492,7 +598,7 @@ def _valuation_node(state: ValuationState) -> ValuationState:
             projection_years=5,
         )
 
-        # Generate growth rates that decay to terminal
+        # Generate growth rates using the 3-knot spline
         growth_rates = decay_growth_rates(
             company_growth=state.get("revenue_growth_forecast", 0.05),
             industry_growth=state.get("industry_growth_rate", 0.04),
@@ -517,6 +623,14 @@ def _valuation_node(state: ValuationState) -> ValuationState:
         # --- Relative Valuation ---
         yahoo = YahooFinanceFetcher()
         peer_metrics_list = yahoo.fetch_peer_metrics(state.get("peer_tickers", [])[:8])
+
+        # FMP/Alpha Vantage fallback for NaN peer data
+        if not peer_metrics_list or _has_nan_peers(peer_metrics_list):
+            logger.info("[Valuation Engine] Peer data has NaN — attempting FMP/Alpha Vantage fallback")
+            fallback_peers = _fetch_fallback_peer_metrics(state.get("peer_tickers", [])[:8])
+            if fallback_peers:
+                peer_metrics_list = fallback_peers
+                logger.info(f"[Valuation Engine] Fallback succeeded — {len(peer_metrics_list)} peers")
 
         rel_val = RelativeValuation(
             company_metrics={
@@ -591,10 +705,10 @@ def _valuation_node(state: ValuationState) -> ValuationState:
 
 
 def _recommendation_node(state: ValuationState) -> ValuationState:
-    """Final recommendation synthesis via LLM."""
+    """Final recommendation synthesis via LLM with 7-factor confidence scoring."""
     logger.info("[Recommendation Agent] Synthesizing final recommendation...")
 
-    # First, apply the quantitative decision rule
+    # First, apply the quantitative decision rule (NO OVERRIDE)
     current_price = state.get("current_price", 0.0)
     intrinsic_value = state.get("intrinsic_value", 0.0)
 
@@ -609,16 +723,15 @@ def _recommendation_node(state: ValuationState) -> ValuationState:
     else:
         quant_rec = "HOLD"
 
-    # Compute a base confidence score from Monte Carlo stats
-    mc_stats = state.get("monte_carlo_stats", {})
-    base_confidence = 50
-    if mc_stats and "std_dev" in mc_stats:
-        std = mc_stats["std_dev"]
-        mean = mc_stats.get("mean", intrinsic_value)
-        if mean > 0:
-            cv = std / mean
-            precision_score = max(0, 100 - cv * 100)
-            base_confidence = int(precision_score * 0.4 + 30)  # partial weight
+    # Compute 7-factor confidence score
+    confidence_breakdown = _compute_confidence(state)
+    confidence_score = sum(confidence_breakdown.values())
+    confidence_score = max(0, min(100, int(confidence_score)))
+
+    state["confidence_breakdown"] = confidence_breakdown
+    state["confidence_score"] = confidence_score
+
+    logger.info(f"[Recommendation Agent] Base confidence: {confidence_score}/100 (7-factor)")
 
     # If DeepSeek is available, get a narrative recommendation
     if get_config().has_deepseek:
@@ -647,6 +760,13 @@ def _recommendation_node(state: ValuationState) -> ValuationState:
 - Financial Health: {state.get('financial_health_score', 5.0):.1f}/10
 - Narrative: {state.get('company_narrative', 'N/A')[:500]}
 
+### Growth Attribution
+{state.get('growth_attribution', {})}
+
+### Assumption Validation
+- Flags: {state.get('validation_flags', [])}
+- Report: {state.get('validation_report', {})}
+
 ### Valuation Results
 - Current Price: ${current_price:.2f}
 - Intrinsic Value (Blended): ${intrinsic_value:.2f}
@@ -654,7 +774,10 @@ def _recommendation_node(state: ValuationState) -> ValuationState:
 - WACC: {state.get('wacc', 0.10)*100:.2f}%
 - Quantitative Recommendation: {quant_rec}
 - Fair Value Range: ${state.get('fair_value_low', 0):.2f} - ${state.get('fair_value_high', 0):.2f}
-- Base Confidence: {base_confidence}/100
+
+### Computed Confidence (7-Factor)
+{confidence_breakdown}
+Total: {confidence_score}/100
 
 ### Scenario Analysis
 Bull: ${state.get('scenario_results', {}).get('Bull', {}).get('intrinsic_value_per_share', 0):.2f}
@@ -671,10 +794,16 @@ Bear: ${state.get('scenario_results', {}).get('Bear', {}).get('intrinsic_value_p
             parsed = _parse_json_output(response.content if hasattr(response, 'content') else str(response))
 
             state["recommendation"] = parsed.get("recommendation", quant_rec)
-            state["confidence_score"] = parsed.get("confidence_score", base_confidence)
             state["executive_summary"] = parsed.get("executive_summary", "")
             state["key_drivers"] = parsed.get("key_drivers", [])
             state["key_risks"] = parsed.get("key_risks", [])
+            state["binary_risk_flags"] = parsed.get("binary_risk_flags", [])
+
+            # Use LLM confidence if provided, otherwise keep computed
+            if "confidence_score" in parsed and parsed["confidence_score"] is not None:
+                state["confidence_score"] = parsed["confidence_score"]
+            if parsed.get("confidence_breakdown"):
+                state["confidence_breakdown"] = parsed["confidence_breakdown"]
 
             logger.info(
                 f"[Recommendation Agent] {state['recommendation']} | "
@@ -683,7 +812,6 @@ Bear: ${state.get('scenario_results', {}).get('Bear', {}).get('intrinsic_value_p
         except Exception as exc:
             logger.error(f"[Recommendation Agent] LLM call failed: {exc} — using quantitative rule")
             state["recommendation"] = quant_rec
-            state["confidence_score"] = base_confidence
             state["executive_summary"] = (
                 f"Quantitative analysis suggests a {quant_rec} recommendation for "
                 f"{state.get('company_name', state['ticker'])} ({state['ticker']}) "
@@ -692,10 +820,10 @@ Bear: ${state.get('scenario_results', {}).get('Bear', {}).get('intrinsic_value_p
             )
             state["key_drivers"] = state.get("key_company_drivers", [])
             state["key_risks"] = state.get("key_company_risks", [])
+            state["binary_risk_flags"] = []
     else:
         # No LLM — use quantitative rule
         state["recommendation"] = quant_rec
-        state["confidence_score"] = base_confidence
         state["executive_summary"] = (
             f"Quantitative analysis suggests a {quant_rec} recommendation for "
             f"{state.get('company_name', state['ticker'])} ({state['ticker']}) "
@@ -704,9 +832,296 @@ Bear: ${state.get('scenario_results', {}).get('Bear', {}).get('intrinsic_value_p
         )
         state["key_drivers"] = state.get("key_company_drivers", [])
         state["key_risks"] = state.get("key_company_risks", [])
+        state["binary_risk_flags"] = []
+
+    # Record recommendation for backtesting
+    try:
+        store = BacktestStore()
+        store.record_recommendation(state["ticker"], dict(state))
+        logger.debug(f"[Backtest] Recommendation recorded for {state['ticker']}")
+    except Exception as exc:
+        logger.warning(f"[Backtest] Failed to record recommendation: {exc}")
 
     state["status"] = "complete"
     return state
+
+
+# ---------------------------------------------------------------------------
+# 7-Factor Confidence Computation
+# ---------------------------------------------------------------------------
+
+
+def _compute_confidence(state: ValuationState) -> dict[str, float]:
+    """Compute the 7-factor confidence score from all available data.
+
+    Weights:
+      1. Forecast Precision (25%): Monte Carlo CV
+      2. Model Agreement (20%): DCF vs Relative valuation spread
+      3. Data Quality (15%): Completeness of financial data
+      4. Historical Stability (10%): Variance in historical margins/growth
+      5. Analyst Consensus (10%): Dispersion of analyst estimates
+      6. Macro Uncertainty (10%): Current macro volatility indicators
+      7. Assumption Validation (10%): GREEN/AMBER/RED flags
+    """
+    mc_stats = state.get("monte_carlo_stats", {})
+    dcf_details = state.get("dcf_details", {})
+    rel_details = state.get("relative_val_details", {})
+    fin = state.get("financials", {})
+    val_report = state.get("validation_report", {})
+
+    # 1. Forecast Precision (max 25 pts)
+    forecast_precision = 15.0  # default
+    if mc_stats and mc_stats.get("std_dev", 0) > 0:
+        std = mc_stats["std_dev"]
+        mean = mc_stats.get("mean", 1)
+        if mean > 0:
+            cv = std / mean
+            if cv < 0.10:
+                forecast_precision = 25.0
+            elif cv < 0.15:
+                forecast_precision = 22.0
+            elif cv < 0.20:
+                forecast_precision = 18.0
+            elif cv < 0.30:
+                forecast_precision = 12.0
+            elif cv < 0.50:
+                forecast_precision = 6.0
+            else:
+                forecast_precision = 2.0
+
+    # 2. Model Agreement (max 20 pts)
+    model_agreement = 10.0  # default
+    dcf_iv = dcf_details.get("intrinsic_value_per_share", 0)
+    rel_iv = rel_details.get("blended_relative_value", 0)
+    if dcf_iv > 0 and rel_iv > 0:
+        spread_pct = abs(dcf_iv - rel_iv) / ((dcf_iv + rel_iv) / 2)
+        if spread_pct < 0.10:
+            model_agreement = 20.0
+        elif spread_pct < 0.20:
+            model_agreement = 16.0
+        elif spread_pct < 0.30:
+            model_agreement = 12.0
+        elif spread_pct < 0.50:
+            model_agreement = 6.0
+        else:
+            model_agreement = 2.0
+
+    # 3. Data Quality (max 15 pts)
+    data_quality = 10.0  # default
+    quality_deductions = 0
+    if not fin.get("revenue"):
+        quality_deductions += 3
+    if not fin.get("operating_cash_flow"):
+        quality_deductions += 3
+    if not fin.get("free_cash_flow"):
+        quality_deductions += 2
+    if not fin.get("eps"):
+        quality_deductions += 2
+    peers = state.get("peer_tickers", [])
+    if len(peers) < 3:
+        quality_deductions += 2
+    if state.get("relative_val_details", {}).get("num_peers", 0) == 0:
+        quality_deductions += 3
+    data_quality = max(0, 15 - quality_deductions)
+
+    # 4. Historical Stability (max 10 pts)
+    historical_stability = 6.0  # default
+    # If the company has stable historical margins (low variance), score higher
+    # This is approximated from available data
+    if fin.get("fcf_margin", 0) > 0:
+        # Higher base for companies with positive FCF margins
+        historical_stability = 7.0
+    if fin.get("roic", 0) > 0.10:
+        historical_stability += 1.0
+
+    # 5. Analyst Consensus (max 10 pts)
+    analyst_consensus = 5.0  # default — neutral when no data
+    # Can be improved by fetching actual analyst dispersion data
+
+    # 6. Macro Uncertainty (max 10 pts)
+    macro_uncertainty = 6.0  # default — moderate
+    crp = state.get("country_risk_premium", 0.0)
+    inflation = state.get("inflation_forecast", 0.03)
+    # Lower score for high CRP or high inflation
+    if crp > 0.005:  # >50 bps
+        macro_uncertainty -= 2.0
+    if inflation > 0.05:  # >5% inflation
+        macro_uncertainty -= 2.0
+    if crp == 0.0:
+        macro_uncertainty = 9.0  # US companies get highest macro certainty
+    macro_uncertainty = max(0, min(10, macro_uncertainty))
+
+    # 7. Assumption Validation (max 10 pts)
+    assumption_validation = 10.0  # default — all GREEN
+    if val_report:
+        red_count = val_report.get("red_count", 0)
+        amber_count = val_report.get("amber_count", 0)
+        assumption_validation -= red_count * 3.5
+        assumption_validation -= amber_count * 1.5
+    assumption_validation = max(0, min(10, assumption_validation))
+
+    return {
+        "forecast_precision": round(forecast_precision, 1),
+        "model_agreement": round(model_agreement, 1),
+        "data_quality": round(data_quality, 1),
+        "historical_stability": round(historical_stability, 1),
+        "analyst_consensus": round(analyst_consensus, 1),
+        "macro_uncertainty": round(macro_uncertainty, 1),
+        "assumption_validation": round(assumption_validation, 1),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Statutory tax rate by jurisdiction
+# ---------------------------------------------------------------------------
+
+# Source: OECD Corporate Tax Statistics 2024 / KPMG global tax rate table.
+# Damodaran convention: use statutory (marginal) rate, not effective rate.
+_STATUTORY_TAX_RATES: dict[str, float] = {
+    "UNITED STATES": 0.21,
+    "US": 0.21,
+    "UNITED KINGDOM": 0.25,
+    "UK": 0.25,
+    "GERMANY": 0.30,
+    "JAPAN": 0.2966,
+    "FRANCE": 0.2583,
+    "CANADA": 0.2621,
+    "AUSTRALIA": 0.30,
+    "SWITZERLAND": 0.1966,
+    "NETHERLANDS": 0.258,
+    "SWEDEN": 0.206,
+    "NORWAY": 0.22,
+    "DENMARK": 0.22,
+    "FINLAND": 0.20,
+    "BELGIUM": 0.25,
+    "AUSTRIA": 0.23,
+    "IRELAND": 0.125,
+    "ITALY": 0.2781,
+    "SPAIN": 0.25,
+    "PORTUGAL": 0.315,
+    "GREECE": 0.22,
+    "SOUTH KOREA": 0.242,
+    "KOREA": 0.242,
+    "TAIWAN": 0.20,
+    "CHINA": 0.25,
+    "INDIA": 0.252,
+    "BRAZIL": 0.34,
+    "MEXICO": 0.30,
+    "INDONESIA": 0.22,
+    "SOUTH AFRICA": 0.27,
+    "TURKEY": 0.25,
+    "RUSSIA": 0.20,
+    "SAUDI ARABIA": 0.20,
+    "UAE": 0.09,
+    "SINGAPORE": 0.17,
+    "HONG KONG": 0.165,
+    "MALAYSIA": 0.24,
+    "THAILAND": 0.20,
+    "VIETNAM": 0.20,
+    "PHILIPPINES": 0.25,
+    "ISRAEL": 0.23,
+    "CHILE": 0.27,
+    "COLOMBIA": 0.35,
+    "ARGENTINA": 0.35,
+    "NIGERIA": 0.30,
+    "EGYPT": 0.225,
+    "PAKISTAN": 0.29,
+    "BANGLADESH": 0.275,
+}
+
+
+def _get_statutory_tax_rate(country: str) -> float:
+    """Return the statutory corporate tax rate for a given country.
+
+    Falls back to 0.21 (US rate / global median) for unrecognized countries.
+    """
+    if not country:
+        return 0.21
+    key = country.upper().strip()
+    # Try exact match first, then partial match
+    if key in _STATUTORY_TAX_RATES:
+        return _STATUTORY_TAX_RATES[key]
+    for known_country, rate in _STATUTORY_TAX_RATES.items():
+        if known_country in key or key in known_country:
+            return rate
+    return 0.21  # fallback: US/global median rate
+
+
+# ---------------------------------------------------------------------------
+# FMP / Alpha Vantage fallback for peer data
+# ---------------------------------------------------------------------------
+
+
+def _has_nan_peers(peer_metrics_list: list[dict]) -> bool:
+    """Check if all peers have NaN for their key multiples."""
+    import math
+    if not peer_metrics_list:
+        return True
+    nan_count = 0
+    for p in peer_metrics_list:
+        pe = p.get("pe_ratio")
+        ev_ebitda = p.get("ev_ebitda")
+        pe_is_nan = pe is None or (isinstance(pe, float) and math.isnan(pe))
+        ev_is_nan = ev_ebitda is None or (isinstance(ev_ebitda, float) and math.isnan(ev_ebitda))
+        if pe_is_nan and ev_is_nan:
+            nan_count += 1
+    return nan_count >= len(peer_metrics_list) * 0.5
+
+
+def _fetch_fallback_peer_metrics(peer_tickers: list[str]) -> list[dict]:
+    """Fall back to FMP or Alpha Vantage for peer metrics when yfinance returns NaN."""
+    from src.data.http_cache import get_http_session
+    config = get_config()
+    session = get_http_session()
+
+    # Try FMP first
+    fmp_key = config.fmp_api_key or ""
+    if fmp_key:
+        try:
+            results = []
+            for ticker in peer_tickers[:5]:
+                url = f"https://financialmodelingprep.com/api/v3/key-metrics/{ticker}?apikey={fmp_key}&limit=1"
+                resp = session.get(url, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data:
+                        d = data[0]
+                        results.append({
+                            "ticker": ticker,
+                            "pe_ratio": d.get("peRatio"),
+                            "ev_ebitda": d.get("enterpriseValueOverEBITDA"),
+                            "pb_ratio": d.get("pbRatio"),
+                        })
+            if results:
+                logger.info(f"[Fallback] FMP returned {len(results)} peer metrics")
+                return results
+        except Exception as exc:
+            logger.warning(f"[Fallback] FMP failed: {exc}")
+
+    # Try Alpha Vantage
+    av_key = config.alpha_vantage_api_key or ""
+    if av_key:
+        try:
+            results = []
+            for ticker in peer_tickers[:3]:  # AV has tight rate limits
+                url = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={ticker}&apikey={av_key}"
+                resp = session.get(url, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data and "PERatio" in data:
+                        results.append({
+                            "ticker": ticker,
+                            "pe_ratio": float(data.get("PERatio", "nan")) if data.get("PERatio") not in ("None", "") else None,
+                            "ev_ebitda": float(data.get("EVToEBITDA", "nan")) if data.get("EVToEBITDA") not in ("None", "") else None,
+                            "pb_ratio": float(data.get("PriceToBookRatio", "nan")) if data.get("PriceToBookRatio") not in ("None", "") else None,
+                        })
+            if results:
+                logger.info(f"[Fallback] Alpha Vantage returned {len(results)} peer metrics")
+                return results
+        except Exception as exc:
+            logger.warning(f"[Fallback] Alpha Vantage failed: {exc}")
+
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -719,11 +1134,11 @@ def build_graph() -> StateGraph:
 
     Graph structure:
         DataFetch → CountryAgent → IndustryAgent → CompanyAgent
-                  → ValuationEngine → RecommendationAgent → END
+                  → AssumptionValidation → ValuationEngine → RecommendationAgent → END
 
-    The ValuationEngine is pure Python (no LLM), so the pipeline works
-    even without a configured LLM — it just uses default assumptions
-    from financial data.
+    The ValuationEngine is pure Python (no LLM). AssumptionValidation is a
+    pre-DCF guardrail that checks all agent outputs against historical ranges
+    and industry benchmarks before they enter the valuation.
     """
     graph = StateGraph(ValuationState)
 
@@ -732,15 +1147,17 @@ def build_graph() -> StateGraph:
     graph.add_node("country_agent", _country_agent_node)
     graph.add_node("industry_agent", _industry_agent_node)
     graph.add_node("company_agent", _company_agent_node)
+    graph.add_node("assumption_validation", _assumption_validation_node)
     graph.add_node("valuation_engine", _valuation_node)
     graph.add_node("recommendation_agent", _recommendation_node)
 
-    # Define edges (linear pipeline)
+    # Define edges (linear pipeline with validation gate)
     graph.set_entry_point("data_fetch")
     graph.add_edge("data_fetch", "country_agent")
     graph.add_edge("country_agent", "industry_agent")
     graph.add_edge("industry_agent", "company_agent")
-    graph.add_edge("company_agent", "valuation_engine")
+    graph.add_edge("company_agent", "assumption_validation")
+    graph.add_edge("assumption_validation", "valuation_engine")
     graph.add_edge("valuation_engine", "recommendation_agent")
     graph.add_edge("recommendation_agent", END)
 
@@ -762,8 +1179,8 @@ def run_valuation(ticker: str) -> ValuationState:
     """Run the full valuation pipeline for a ticker and return the final state.
 
     Executes the agent nodes sequentially (Country → Industry → Company →
-    Valuation → Recommendation).  This is the primary entry point for
-    programmatic use.
+    Validation → Valuation → Recommendation).  This is the primary entry
+    point for programmatic use.
 
     Falls back to sequential execution if LangGraph compilation fails.
     """
@@ -785,6 +1202,7 @@ def run_valuation(ticker: str) -> ValuationState:
         ("Country Agent", _country_agent_node),
         ("Industry Agent", _industry_agent_node),
         ("Company Agent", _company_agent_node),
+        ("Assumption Validation", _assumption_validation_node),
         ("Valuation Engine", _valuation_node),
         ("Recommendation", _recommendation_node),
     ]

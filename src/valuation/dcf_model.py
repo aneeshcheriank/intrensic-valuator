@@ -264,25 +264,36 @@ def decay_growth_rates(
     terminal_growth: float,
     projection_years: int = 5,
 ) -> list[float]:
-    """Generate growth rates that decay from company → industry → terminal.
+    """Generate growth rates using a continuous 3-knot linear spline.
 
-    Years 1-3: decay from company rate toward industry rate.
-    Years 4-5: decay from industry rate toward terminal rate.
+    Knots:
+      Year 0  → Company_Growth   (firm-specific starting point)
+      Year 3  → Industry_Growth  (convergence to sector norm)
+      Year 5+ → Terminal_Growth  (long-run GDP growth)
+
+    Years 1-3: Company_Growth → Industry_Growth (linear interpolation)
+    Years 4-5: Industry_Growth → Terminal_Growth (linear decay toward perpetuity)
+
+    At year 3, the rate EQUALS industry_growth — a mathematically seamless
+    transition that preserves the top-down 3-layer anchoring.
 
     This ensures projections are grounded: no company can grow above its
-    industry forever.
+    industry forever, and every industry converges to macro fundamentals.
     """
     rates = []
-    transition_point = min(3, projection_years)
-
-    for i in range(projection_years):
-        year = i + 1
-        if year <= transition_point:
-            frac = year / (transition_point + 1)
-            rate = company_growth + frac * (industry_growth - company_growth)
-        else:
-            frac = (year - transition_point) / (projection_years - transition_point + 1)
-            rate = industry_growth + frac * (terminal_growth - industry_growth)
+    # First segment: Company → Industry (years 1-3)
+    segment1_end = min(3, projection_years)
+    for year in range(1, segment1_end + 1):
+        frac = year / segment1_end  # 1/3, 2/3, 3/3=1.0
+        rate = company_growth + frac * (industry_growth - company_growth)
         rates.append(rate)
+
+    # Second segment: Industry → Terminal (years 4+)
+    remaining = projection_years - segment1_end
+    if remaining > 0:
+        for step in range(1, remaining + 1):
+            frac = step / (remaining + 1)  # gradual decay, doesn't fully reach terminal
+            rate = industry_growth + frac * (terminal_growth - industry_growth)
+            rates.append(rate)
 
     return rates

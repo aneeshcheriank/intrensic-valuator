@@ -170,7 +170,7 @@ if scenarios:
 
 # Analysis narratives
 st.subheader("📝 Analysis")
-tabs = st.tabs(["Country", "Industry", "Company", "Recommendation"])
+tabs = st.tabs(["Country", "Industry", "Company", "Validation", "Recommendation"])
 
 with tabs[0]:
     st.caption(f"Country: {state.get('country', 'N/A')}")
@@ -196,7 +196,65 @@ with tabs[2]:
     if state.get("company_narrative"):
         st.markdown(state["company_narrative"][:1500])
 
+    # Growth Attribution
+    growth_attr = state.get("growth_attribution", {})
+    if growth_attr:
+        st.markdown("---")
+        st.markdown("**🌱 Growth Attribution**")
+        attr_cols = st.columns(3)
+        components = [
+            ("Historical CAGR", "historical_cagr"),
+            ("Industry Tailwind", "industry_tailwind"),
+            ("Product Expansion", "product_expansion"),
+            ("Geographic Expansion", "geographic_expansion"),
+            ("Management Execution", "management_execution"),
+            ("Regulatory Impact", "regulatory_impact"),
+        ]
+        for i, (label, key) in enumerate(components):
+            with attr_cols[i % 3]:
+                val = growth_attr.get(key, 0)
+                st.metric(label, f"{val*100:+.1f}%")
+        st.caption(f"Net Forecast: {growth_attr.get('net_forecast', 0)*100:.1f}%")
+
+    # Evidence chain
+    evidence = state.get("company_evidence_chain", {})
+    if evidence:
+        st.markdown("---")
+        st.markdown("**📋 Evidence Chain**")
+        for param, ev_text in evidence.items():
+            if ev_text:
+                with st.expander(f"{param.replace('_', ' ').title()}"):
+                    st.caption(ev_text[:500])
+
 with tabs[3]:
+    # Assumption Validation
+    val_report = state.get("validation_report", {})
+    val_flags = state.get("validation_flags", [])
+
+    if val_report:
+        green = val_report.get("green_count", 0)
+        amber = val_report.get("amber_count", 0)
+        red = val_report.get("red_count", 0)
+        vcols = st.columns(3)
+        with vcols[0]:
+            st.metric("🟢 Green", green)
+        with vcols[1]:
+            st.metric("🟡 Amber", amber)
+        with vcols[2]:
+            st.metric("🔴 Red", red)
+        st.caption(f"Overall Band: {val_report.get('overall_band', 'N/A')}")
+
+    if val_flags:
+        st.markdown("**Flagged Assumptions:**")
+        for flag in val_flags:
+            band = flag.get("band", "GREEN")
+            emoji = {"RED": "🔴", "AMBER": "🟡", "GREEN": "🟢"}.get(band, "⚪")
+            with st.expander(f"{emoji} [{band}] {flag.get('parameter', '')}: {flag.get('agent_value', 0)*100:.1f}% → capped at {flag.get('capped_value', 0)*100:.1f}%"):
+                st.caption(flag.get("message", ""))
+    else:
+        st.success("All assumptions passed validation (GREEN).")
+
+with tabs[4]:
     st.markdown(f"**Recommendation:** :{'green' if rec == 'BUY' else 'red' if rec == 'SELL' else 'orange'}[{rec}]")
     if state.get("key_drivers"):
         st.markdown("**Key Drivers:**")
@@ -206,8 +264,33 @@ with tabs[3]:
         st.markdown("**Key Risks:**")
         for r in state.get("key_risks", []):
             st.markdown(f"- ⚠️ {r}")
+    if state.get("binary_risk_flags"):
+        st.markdown("**Binary Event Risks (affect confidence, not valuation):**")
+        for br in state.get("binary_risk_flags", []):
+            st.markdown(f"- ⚡ {br}")
     if state.get("executive_summary"):
         st.markdown(state["executive_summary"][:2000])
+
+    # Confidence Breakdown
+    conf_breakdown = state.get("confidence_breakdown", {})
+    if conf_breakdown:
+        st.markdown("---")
+        st.markdown("**📊 Confidence Breakdown (7-Factor Model)**")
+        conf_items = [
+            ("Forecast Precision", "forecast_precision", 25),
+            ("Model Agreement", "model_agreement", 20),
+            ("Data Quality", "data_quality", 15),
+            ("Historical Stability", "historical_stability", 10),
+            ("Analyst Consensus", "analyst_consensus", 10),
+            ("Macro Uncertainty", "macro_uncertainty", 10),
+            ("Assumption Validation", "assumption_validation", 10),
+        ]
+        for label, key, max_val in conf_items:
+            val = conf_breakdown.get(key, 0)
+            pct = val / max_val if max_val > 0 else 0
+            color = "green" if pct > 0.7 else "orange" if pct > 0.4 else "red"
+            st.markdown(f"**{label}:** :{color}[{val:.1f} / {max_val}]")
+        st.metric("Total Confidence", f"{state.get('confidence_score', 50)}/100")
 
 # Warnings
 errors = state.get("errors", [])
